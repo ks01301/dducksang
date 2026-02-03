@@ -14,6 +14,8 @@ class Strategy(QObject):
             'stop_loss': -2.0, 
             'take_profit': 5.0
         }
+        self.universe = []         # 감시 대상 전체 종목 리스트
+        self.manual_universe = []  # 사용자가 직접 추가한 종목 리스트 (영구 저장용)
         self.config_file = None
 
     def load_config(self, user_id):
@@ -25,9 +27,24 @@ class Strategy(QObject):
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
-                    saved_params = json.load(f)
-                    self.params.update(saved_params)
-                self.log_msg.emit(f"⚙️ 전략 설정 로드 완료: {user_id}")
+                    data = json.load(f)
+                    
+                    # 1. 파라미터 로드
+                    if 'params' in data:
+                        self.params.update(data['params'])
+                    else:
+                        # 하위 호환성: 이전 포맷(전체가 params인 경우) 처리
+                        self.params.update(data)
+                        
+                    # 2. 수동 유니버스 로드
+                    if 'manual_universe' in data:
+                        self.manual_universe = data['manual_universe']
+                        # universe에도 반영 (중복 제거)
+                        for code in self.manual_universe:
+                            if code not in self.universe:
+                                self.universe.append(code)
+                                
+                self.log_msg.emit(f"⚙️ 전략 설정 및 수동 감시 리스트 로드 완료: {user_id}")
             except Exception as e:
                 self.log_msg.emit(f"⚠️ 전략 설정 로드 실패: {e}")
         else:
@@ -40,8 +57,12 @@ class Strategy(QObject):
             return
             
         try:
+            data = {
+                'params': self.params,
+                'manual_universe': self.manual_universe
+            }
             with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.params, f, ensure_ascii=False, indent=2)
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self.log_msg.emit(f"⚠️ 전략 설정 저장 실패: {e}")
     
@@ -134,7 +155,6 @@ class VolatilityBreakoutStrategy(Strategy):
     def __init__(self, kiwoom, asset_manager):
         super().__init__(kiwoom, asset_manager)
         self.target_prices = {}  # 종목별 목표 매수가
-        self.universe = []       # 감시 대상 종목 리스트
 
     def set_universe(self, codes):
         """감시 대상 종목 설정 및 목표가 계산"""

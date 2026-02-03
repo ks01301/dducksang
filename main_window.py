@@ -205,9 +205,7 @@ class MainWindow(QMainWindow):
         auto_watchlist_group = self.create_auto_watchlist_group()
         layout.addWidget(auto_watchlist_group)
         
-        # 2. 하단 로깅 영역 (기존 유지)
-        log_group = self.create_log_group()
-        layout.addWidget(log_group)
+        # [REMOVED] 하단 중복 로깅 영역을 제거합니다. (init_main_window의 공통 로그가 하단에 위치함)
         
         # 2. 상단 영역 (종목조회 + 주문입력)
         top_layout = QHBoxLayout()
@@ -661,11 +659,20 @@ class MainWindow(QMainWindow):
         self.lbl_strategy_params = QLabel("K: - | 손절: -% | 익절: -%")
         self.lbl_strategy_params.setStyleSheet("color: #333; font-size: 13px;")
         
+        # 종목 스캔 정보
+        self.lbl_scan_status = QLabel("스캔: OFF")
+        self.lbl_scan_status.setStyleSheet("color: #d9534f; font-weight: bold;") # 빨간색 (OFF)
+        self.lbl_scan_profile = QLabel("| 프로필: -")
+        self.lbl_scan_profile.setStyleSheet("color: #333; font-size: 13px;")
+        
         layout.addWidget(QLabel("전략:"))
         layout.addWidget(self.lbl_strategy_name)
         layout.addSpacing(20)
         layout.addWidget(QLabel("설정:"))
         layout.addWidget(self.lbl_strategy_params)
+        layout.addSpacing(40)
+        layout.addWidget(self.lbl_scan_status)
+        layout.addWidget(self.lbl_scan_profile)
         layout.addStretch()
         
         group.setLayout(layout)
@@ -679,7 +686,23 @@ class MainWindow(QMainWindow):
         take = params.get('take_profit', 5.0)
         
         self.lbl_strategy_params.setText(f"K: {k} | 손절: {stop}% | 익절: {take}%")
-        self.log(f"ℹ️ 전략 정보 갱신: K={k}, 손절={stop}%, 익절={take}%")
+        
+        # 종목 스캔 정보 반영
+        if hasattr(self, 'chk_auto_scan'):
+            is_scan_on = self.chk_auto_scan.isChecked()
+            profile = self.combo_scan_profile.currentText()
+            
+            if is_scan_on:
+                self.lbl_scan_status.setText("스캔: RUNNING")
+                self.lbl_scan_status.setStyleSheet("color: #4CAF50; font-weight: bold;") # 녹색
+                self.lbl_scan_profile.setText(f"| 프로필: {profile}")
+                self.lbl_scan_profile.show()
+            else:
+                self.lbl_scan_status.setText("스캔: OFF")
+                self.lbl_scan_status.setStyleSheet("color: #d9534f; font-weight: bold;") # 빨간색
+                self.lbl_scan_profile.hide()
+        
+        self.log(f"ℹ️ 대시보드 갱신 (전략: K={k}/S={stop}% | 스캔: {'ON' if self.chk_auto_scan.isChecked() else 'OFF'})")
 
     @pyqtSlot()
     def refresh_asset_status(self):
@@ -1370,8 +1393,9 @@ class MainWindow(QMainWindow):
         form_layout = QFormLayout()
         
         # 자동 스캔 여부
-        self.chk_auto_scan = QCheckBox("실시간 스마트 스캔 활성화")
+        self.chk_auto_scan = QCheckBox("실시간 전략 발굴 (스마트 스캔) 활성화")
         self.chk_auto_scan.setToolTip("활성화 시 60초마다 시장을 분석하여 유리한 종목을 자동 발굴합니다.")
+        self.chk_auto_scan.stateChanged.connect(self.refresh_strategy_info)
         
         # 스캔 프로필
         self.combo_scan_profile = QComboBox()
@@ -1381,6 +1405,7 @@ class MainWindow(QMainWindow):
             "볼린저 밴드 돌파 (Vola)", 
             "사용자 정의"
         ])
+        self.combo_scan_profile.currentIndexChanged.connect(self.refresh_strategy_info)
         self.combo_scan_profile.currentIndexChanged.connect(self.update_scan_profile_desc)
         
         # 상세 필터 설정 (사용자 정의 시 활성화)
@@ -1543,6 +1568,16 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 self.combo_scan_profile.setCurrentIndex(index)
                 self.update_scan_profile_desc(index)
+                
+        # 수동 감시 종목 리스트 복구
+        self.table_watchlist_manual.setRowCount(0)
+        for code in self.strategy.manual_universe:
+            # 종목명 조회 (GetMasterCodeName)
+            name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
+            self.add_watchlist_row_manual(code, name)
+            
+        self.strategy.set_universe(self.strategy.universe) # 목표가 재계산 트리거
+
 
     @pyqtSlot()
     def toggle_trading(self):
@@ -1610,18 +1645,31 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "경고", "로그인이 필요합니다.")
             return
 
-        self.log(f"🔍 {code} 종목 분석 및 사장님 픽 추가 중...")
+        self.log(f"🔍 {code} 종목 분석 및 수동 감시 리스트 추가 중...")
         
-        # 1. 전략 유니버스에 추가 (수동 태그)
-        self.strategy.set_universe(self.strategy.universe + [code])
+        # 1. 전략 유니버스에 추가 (수동 리스트 중복 체크)
+        if code not in self.strategy.manual_universe:
+            self.strategy.manual_universe.append(code)
+            if code not in self.strategy.universe:
+                self.strategy.universe.append(code)
+            
+            # 저장
+            self.strategy.save_config()
+            
+            # 2. UI 테이블에 추가
+            name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
+            self.add_watchlist_row_manual(code, name)
+            
+            # 목표가 계산 트리거
+            self.strategy.calculate_target_price(code)
         
-        # 2. UI 테이블에 추가
+        self.input_watch_code.clear()
+
+    def add_watchlist_row_manual(self, code, name):
+        """수동 감시 테이블에 한 줄 추가 (내부용)"""
         row = self.table_watchlist_manual.rowCount()
         self.table_watchlist_manual.insertRow(row)
         self.table_watchlist_manual.setItem(row, 0, QTableWidgetItem(code))
-        
-        # 종목명 조회 (GetMasterCodeName)
-        name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
         self.table_watchlist_manual.setItem(row, 1, QTableWidgetItem(name))
         self.table_watchlist_manual.setItem(row, 2, QTableWidgetItem("조회중"))
         
@@ -1629,8 +1677,6 @@ class MainWindow(QMainWindow):
         target = self.strategy.target_prices.get(code, 0)
         self.table_watchlist_manual.setItem(row, 3, QTableWidgetItem(f"{target:,}"))
         self.table_watchlist_manual.setItem(row, 4, QTableWidgetItem("감시중"))
-        
-        self.input_watch_code.clear()
 
     @pyqtSlot()
     def remove_watch_stock(self):
@@ -1642,9 +1688,17 @@ class MainWindow(QMainWindow):
         code_item = self.table_watchlist_manual.item(row, 0)
         if code_item:
             code = code_item.text()
+            # 1. 수동 리스트에서 제거
+            if code in self.strategy.manual_universe:
+                self.strategy.manual_universe.remove(code)
+            
+            # 2. 전체 유니버스에서 제거
             self.strategy.remove_stock(code)
+            
+            # UI 및 저장
             self.table_watchlist_manual.removeRow(row)
-            self.log(f"🗑 {code} 감시 해제 (사장님 픽 삭제)")
+            self.strategy.save_config()
+            self.log(f"🗑 {code} 감시 해제 (수동 감시 리스트 삭제 및 저장)")
 
     # ========== 조건검색 관련 메서드 (NEW) ==========
 
