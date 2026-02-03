@@ -19,20 +19,38 @@ class AssetManager:
     - 수익/손실 추적
     """
     
-    def __init__(self, config_file: str = "asset_config.json"):
+    def __init__(self, user_id: str = None):
         """
         Args:
-            config_file: 자산 설정 파일 경로
+            user_id: 사용자 ID (없으면 기본값 초기화)
         """
-        self.config_file = config_file
+        if user_id:
+            self.config_file = f"asset_config_{user_id}.json"
+            self.data = self._load_config()
+        else:
+            self.config_file = None
+            self.data = self._get_default_config()
+
+    def load_user_config(self, user_id: str):
+        """사용자별 설정 로드"""
+        self.config_file = f"asset_config_{user_id}.json"
         self.data = self._load_config()
     
     def _load_config(self) -> Dict:
         """설정 파일 로드"""
-        if os.path.exists(self.config_file):
+        if self.config_file and os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    saved_data = json.load(f)
+                    
+                    # 기본값 생성
+                    data = self._get_default_config()
+                    
+                    # 저장된 데이터 모두 복원 (사용자 요청: 설정값 유지 및 이어하기)
+                    # 초기 설정액, 가용 현금, 누적 수익 등 모든 상태를 마지막 저장 시점으로 복구합니다.
+                    data.update(saved_data)
+                    
+                    return data
             except Exception as e:
                 print(f"설정 파일 로드 실패: {e}")
                 return self._get_default_config()
@@ -48,12 +66,15 @@ class AssetManager:
             'holdings_value': 0,            # 보유 종목 평가액
             'total_profit': 0,              # 누적 수익금
             'profit_rate': 0.0,             # 수익률 (%)
-            'max_stock_amount': 1000000,    # 종목당 최대 매수 금액 (기본 100만원)
+            'max_stock_amount': 0,          # 종목당 최대 매수 금액 (기본 0 = 무제한)
             'last_updated': None
         }
     
     def _save_config(self):
         """설정 파일 저장"""
+        if not self.config_file:
+            return
+            
         try:
             self.data['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -81,7 +102,48 @@ class AssetManager:
         self.data['profit_rate'] = 0.0
         
         self._save_config()
+        self._save_config()
         print(f"✅ 초기 운용 금액 설정: {amount:,}원")
+
+    def add_capital(self, amount: int):
+        """운용 자금 추가 (증액)"""
+        if amount <= 0:
+            raise ValueError("추가 금액은 0보다 커야 합니다.")
+            
+        self.data['initial_capital'] += amount
+        self.data['current_capital'] += amount
+        self.data['available_cash'] += amount
+        
+        if self.data['initial_capital'] > 0:
+            self.data['profit_rate'] = (self.data['total_profit'] / self.data['initial_capital']) * 100
+            
+        self._save_config()
+        print(f"✅ 운용 자금 추가: +{amount:,}원 (총 {self.data['initial_capital']:,}원)")
+
+    def get_total_capital(self) -> int:
+        """현재 운용 설정액(initial_capital) 반환"""
+        return self.data.get('initial_capital', 0)
+
+    def withdraw_capital(self, amount: int):
+        """운용 자금 축소 (감액)"""
+        if amount <= 0:
+            raise ValueError("축소할 금액은 0보다 커야 합니다.")
+            
+        if amount > self.data['available_cash']:
+            raise ValueError(f"가용 현금이 부족합니다. (가용: {self.data['available_cash']:,}원)")
+            
+        self.data['initial_capital'] -= amount
+        self.data['current_capital'] -= amount
+        self.data['available_cash'] -= amount
+        
+        if self.data['initial_capital'] > 0:
+            self.data['profit_rate'] = (self.data['total_profit'] / self.data['initial_capital']) * 100
+        else:
+            self.data['profit_rate'] = 0.0
+            
+        self._save_config()
+        print(f"✅ 운용 자금 축소: -{amount:,}원 (총 {self.data['initial_capital']:,}원)")
+
     
     def set_max_stock_amount(self, amount: int):
         """
@@ -90,8 +152,8 @@ class AssetManager:
         Args:
             amount: 종목당 최대 매수 금액 (원)
         """
-        if amount <= 0:
-            raise ValueError("최대 매수 금액은 0보다 커야 합니다.")
+        if amount < 0:
+            raise ValueError("최대 매수 금액은 0보다 작을 수 없습니다.")
         
         self.data['max_stock_amount'] = amount
         self._save_config()
@@ -131,6 +193,7 @@ class AssetManager:
         """자산 현황 요약 반환"""
         return {
             '초기_운용금액': self.data['initial_capital'],
+            '초기_설정액': self.data['initial_capital'],
             '현재_운용금액': self.data['current_capital'],
             '가용_현금': self.data['available_cash'],
             '보유종목_평가액': self.data['holdings_value'],
@@ -218,9 +281,9 @@ class AssetManager:
         if amount > self.data['available_cash']:
             return False, f"가용 현금 부족 (필요: {amount:,}원, 보유: {self.data['available_cash']:,}원)"
         
-        # 3. 종목당 최대 매수 금액 확인
-        if amount > self.data['max_stock_amount']:
-            return False, f"종목당 최대 매수 금액 초과 (최대: {self.data['max_stock_amount']:,}원)"
+        # 3. 종목당 최대 매수 금액 확인 (0이면 제한 없음)
+        if self.data['max_stock_amount'] > 0 and amount > self.data['max_stock_amount']:
+            return False, f"종목당 최대 매수 한도 초과 (한도: {self.data['max_stock_amount']:,}원)"
         
         return True, "매수 가능"
     
