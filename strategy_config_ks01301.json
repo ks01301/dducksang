@@ -1,5 +1,9 @@
 {
-  "k": -0.5,
-  "stop_loss": 3.0,
-  "take_profit": 5.0
+  "k": 0.5,
+  "stop_loss": -2.0,
+  "take_profit": 5.0,
+  "min_vol": 200.0,
+  "min_price": 3.0,
+  "auto_scan": false,
+  "profile": "볼린저 밴드 돌파 (Vola)"
 }

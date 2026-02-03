@@ -54,6 +54,81 @@ class Strategy(QObject):
         """주기적으로 실행되는 메인 로직"""
         pass
 
+    # ---------- 기술적 지표 계산 헬퍼 (Advanced) ----------
+    
+    def calculate_sma(self, data, period):
+        """단순 이동평균 계산"""
+        if len(data) < period:
+            return None
+        prices = [d['종가'] for d in data[:period]]
+        return sum(prices) / period
+
+    def calculate_bollinger_bands(self, data, period=20, k=2):
+        """볼린저 밴드 계산"""
+        if len(data) < period:
+            return None, None, None
+        
+        import math
+        prices = [d['종가'] for d in data[:period]]
+        avg = sum(prices) / period
+        
+        # 표준편차
+        variance = sum((p - avg) ** 2 for p in prices) / period
+        std_dev = math.sqrt(variance)
+        
+        upper_band = avg + (k * std_dev)
+        lower_band = avg - (k * std_dev)
+        
+        return upper_band, avg, lower_band
+
+    def check_breakout(self, data, period=20):
+        """전고점 돌파 확인 (최근 period일 최고가 상향 돌파)"""
+        if len(data) < period + 1:
+            return False, 0
+        
+        current_price = data[0]['종가']
+        # 오늘 제외 최근 period일 동안의 최고가
+        past_highs = [d['고가'] for d in data[1:period+1]]
+        max_high = max(past_highs)
+        
+        return current_price > max_high, max_high
+
+    def check_trend_alignment(self, data):
+        """정배열 확인 (주가 > 5 > 20 > 60)"""
+        if len(data) < 60:
+            return False
+            
+        sma5 = self.calculate_sma(data, 5)
+        sma20 = self.calculate_sma(data, 20)
+        sma60 = self.calculate_sma(data, 60)
+        
+        current_price = data[0]['종가']
+        
+        if not (sma5 and sma20 and sma60):
+            return False
+            
+        return current_price > sma5 > sma20 > sma60
+
+    def check_golden_cross(self, data, short_p=5, long_p=20):
+        """골든크로스 발생 확인 (오늘 뚫고 올라갔는지)"""
+        if len(data) < long_p + 1:
+            return False
+            
+        # 오늘 시점
+        curr_short = self.calculate_sma(data, short_p)
+        curr_long = self.calculate_sma(data, long_p)
+        
+        # 어제 시점
+        prev_data = data[1:]
+        prev_short = self.calculate_sma(prev_data, short_p)
+        prev_long = self.calculate_sma(prev_data, long_p)
+        
+        if None in [curr_short, curr_long, prev_short, prev_long]:
+            return False
+            
+        # 어제는 작았는데 오늘은 크면 골든크로스
+        return prev_short <= prev_long and curr_short > curr_long
+
 class VolatilityBreakoutStrategy(Strategy):
     """변동성 돌파 전략"""
     def __init__(self, kiwoom, asset_manager):
@@ -98,7 +173,24 @@ class VolatilityBreakoutStrategy(Strategy):
         target_price = current_open + (volatility * k)
         
         self.target_prices[code] = int(target_price)
-        self.log_msg.emit(f"🎯 {code} 목표가 계산 완료: {int(target_price):,}원 (시가: {current_open}, 변동폭: {volatility}, K: {k})")
+        self.log_msg.emit(f"🎯 {code} 목표가 계산: {int(target_price):,}원 (시가 {current_open:,} + 변동 {volatility:,} * K {k})")
+
+    def add_stock(self, code):
+        """종목 추가 (조건검색 등)"""
+        if code not in self.universe:
+            self.universe.append(code)
+            # 즉시 목표가 계산 시도
+            self.calculate_target_price(code)
+            self.log_msg.emit(f"➕ 감시 종목 추가: {code}")
+
+    def remove_stock(self, code):
+        """종목 제거"""
+        if code in self.universe:
+            self.universe.remove(code)
+            if code in self.target_prices:
+                del self.target_prices[code]
+            self.log_msg.emit(f"➖ 감시 종목 해제: {code}")
+
 
     def check_buy_signal(self, code, current_price):
         """매수 신호 확인"""

@@ -12,13 +12,20 @@ os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = plugin_path
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import QEventLoop
+from PyQt5.QtCore import QEventLoop, pyqtSignal, QObject
 
 
-class Kiwoom:
+class Kiwoom(QObject):
     """키움증권 Open API+ 연동 클래스"""
     
+    # 조건검색 및 스캔 관련 시그널
+    sig_condition_load = pyqtSignal(list)       # 조건식 목록 수신 시
+    sig_condition_result = pyqtSignal(str, list) # 조건검색 결과 수신 시
+    sig_real_condition = pyqtSignal(str, str, str) # 실시간 조건편입/이탈
+    sig_scan_result = pyqtSignal(str, list)      # 스마트 스캔 결과 수신 시 (tr_code, data_list)
+
     def __init__(self):
+        super().__init__()
         # QApplication 인스턴스 확인 및 생성
         self.app = QApplication.instance()
         if self.app is None:
@@ -46,7 +53,13 @@ class Kiwoom:
         # TR 데이터 수신 이벤트
         self.ocx.OnReceiveTrData.connect(self._on_receive_tr_data)
         # 주문 체결 이벤트
+        # 주문 체결 이벤트
         self.ocx.OnReceiveChejanData.connect(self._on_receive_chejan_data)
+        
+        # [조건검색] 이벤트 연결
+        self.ocx.OnReceiveConditionVer.connect(self._on_receive_condition_ver)
+        self.ocx.OnReceiveTrCondition.connect(self._on_receive_tr_condition)
+        self.ocx.OnReceiveRealCondition.connect(self._on_receive_real_condition)
     
     # ========== 이벤트 핸들러 ==========
     
@@ -120,6 +133,11 @@ class Kiwoom:
                     '종가': abs(int(close_price))
                 })
             self.data['일봉'] = data
+        
+        elif trcode == "opt10032":  # 거래량급증요청
+            self._on_receive_opt10032(trcode, rqname)
+        elif trcode == "opt10019":  # 가격급등락요청
+            self._on_receive_opt10019(trcode, rqname)
         
         # 이벤트 루프 종료
         if self.event_loop:
@@ -370,6 +388,157 @@ class Kiwoom:
         self.event_loop.exec_()
         
         return self.data.get('일봉', [])
+
+
+    # ========== 조건검색 메서드 ==========
+
+    def get_condition_load(self):
+        """서버에 저장된 사용자 조건식 리스트 요청"""
+        ret = self.ocx.dynamicCall("GetConditionLoad()")
+        if ret == 1:
+            print("🔍 조건식 목록 요청 성공")
+        else:
+            print("❌ 조건식 목록 요청 실패")
+
+    def send_condition(self, screen_no, condition_name, condition_index, is_real_time):
+        """조건검색 실행 요청
+        screen_no: 화면번호
+        condition_name: 조건식 이름
+        condition_index: 조건식 인덱스
+        is_real_time: 0(단순조회), 1(실시간검색)
+        """
+        ret = self.ocx.dynamicCall("SendCondition(QString, QString, int, int)", 
+                                   screen_no, condition_name, condition_index, is_real_time)
+        if ret == 1:
+            print(f"📡 조건검색 요청: {condition_name} (실시간: {is_real_time})")
+        else:
+            print(f"❌ 조건검색 요청 실패: {condition_name}")
+
+    def send_condition_stop(self, screen_no, condition_name, condition_index):
+        """조건검색 중지 요청"""
+        self.ocx.dynamicCall("SendConditionStop(QString, QString, int)", 
+                             screen_no, condition_name, condition_index)
+        print(f"⏹ 조건검색 중지: {condition_name}")
+
+    # ========== 조건검색 이벤트 핸들러 ==========
+
+    def _on_receive_condition_ver(self, ret, msg):
+        """조건식 목록 수신 이벤트"""
+        if ret != 1:
+            return
+            
+        condition_list_str = self.ocx.dynamicCall("GetConditionNameList()")
+        # Format: "index^name;index^name;..."
+        conditions = []
+        if condition_list_str:
+            raw_list = condition_list_str.split(';')
+            for item in raw_list:
+                if not item: continue
+                index, name = item.split('^')
+                conditions.append((int(index), name))
+        
+        print(f"✅ 조건식 목록 수신: {len(conditions)}개")
+        self.sig_condition_load.emit(conditions)
+
+    def _on_receive_tr_condition(self, screen_no, code_list_str, condition_name, index, next):
+        """조건검색 결과 수신 (최초 조회, 실시간 X)"""
+        codes = []
+        if code_list_str:
+            codes = code_list_str.split(';')
+            codes = [c for c in codes if c] # 빈 문자열 제거
+        
+        print(f"🔍 조건검색 결과 [{condition_name}]: {len(codes)}개 발견")
+        # index는 문자열일 수도 있음, 주의 (API 문서는 int지만 pyqt signal은?)
+        # OnReceiveTrCondition(BSTR, BSTR, BSTR, int, int)
+        self.sig_condition_result.emit(str(index), codes)
+
+    def _on_receive_real_condition(self, code, type_str, condition_name, condition_index):
+        """실시간 조건검색 편입/이탈
+        type_str: "I"(편입), "D"(이탈)
+        """
+        type_kor = "편입" if type_str == "I" else "이탈"
+        # print(f"⚡ 실시간 {type_kor}: {code} [{condition_name}]")
+        self.sig_real_condition.emit(code, type_str, str(condition_index))
+
+    # ========== 스마트 스캔 (TR 기반) 메서드 ==========
+
+    def request_volume_surge(self, market="000", sort="1", time_unit="1", vol_unit="1"):
+        """
+        거래량 급증 종목 요청 (opt10032)
+        market: 000:전체, 001:코스피, 101:코스닥
+        sort: 1:급증량, 2:급증률
+        time_unit: 1:1분, 3:3분, 5:5분, 10:10분, 30:30분, 60:60분
+        vol_unit: 1:5일평균거래량대비
+        """
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "시장구분", market)
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "정렬구분", sort)
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "시간구분", time_unit)
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "거래량구분", vol_unit)
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "시간", "1") # 직전 대비
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "종목조건", "0") # 전체
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "가격구분", "0") # 전체가격
+        
+        ret = self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)", "거래량급증", "opt10032", 0, "1032")
+        return ret
+
+    def request_price_surge(self, market="000", up_down="1", time_unit="1"):
+        """
+        가격 급등락 종목 요청 (opt10019)
+        market: 000:전체, 001:코스피, 101:코스닥
+        up_down: 1:급등, 2:급락
+        time_unit: 1:1분, 3:3분, 5:5분, 10:10분, 30:30분, 60:60분
+        """
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "시장구분", market)
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "등락구분", up_down)
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "시간구분", time_unit)
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "시간", "1")
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "종목조건", "0")
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "가격구분", "0")
+        
+        ret = self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)", "가격급등락", "opt10019", 0, "1019")
+        return ret
+
+    # ========== TR 응답 핸들러 ==========
+
+    def _on_receive_opt10032(self, trcode, rqname):
+        """거래량 급증 결과 처리"""
+        count = self.ocx.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
+        results = []
+        for i in range(count):
+            code = self._get_comm_data(trcode, rqname, i, "종목코드")
+            name = self._get_comm_data(trcode, rqname, i, "종목명")
+            volume_rate = self._get_comm_data(trcode, rqname, i, "급증량") # % 단위일 수 있음
+            price = self._get_comm_data(trcode, rqname, i, "현재가")
+            price_rate = self._get_comm_data(trcode, rqname, i, "등락율")
+            
+            results.append({
+                'code': code.strip(),
+                'name': name.strip(),
+                'volume_rate': float(volume_rate.replace('%', '') or 0),
+                'price': abs(int(price or 0)),
+                'price_rate': float(price_rate or 0)
+            })
+        self.sig_scan_result.emit(trcode, results)
+
+    def _on_receive_opt10019(self, trcode, rqname):
+        """가격 급등락 결과 처리"""
+        count = self.ocx.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
+        results = []
+        for i in range(count):
+            code = self._get_comm_data(trcode, rqname, i, "종목코드")
+            name = self._get_comm_data(trcode, rqname, i, "종목명")
+            price = self._get_comm_data(trcode, rqname, i, "현재가")
+            price_rate = self._get_comm_data(trcode, rqname, i, "등락율")
+            volume = self._get_comm_data(trcode, rqname, i, "거래량")
+            
+            results.append({
+                'code': code.strip(),
+                'name': name.strip(),
+                'price': abs(int(price or 0)),
+                'price_rate': float(price_rate or 0),
+                'volume': int(volume or 0)
+            })
+        self.sig_scan_result.emit(trcode, results)
 
 
 if __name__ == "__main__":
