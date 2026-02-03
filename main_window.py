@@ -1386,12 +1386,14 @@ class MainWindow(QMainWindow):
     
     def handle_exception(self, exc_type, exc_value, exc_traceback):
         """시스템 예외 처리 및 로깅"""
+        import sys
+        import traceback
+        
         if issubclass(exc_type, KeyboardInterrupt):
             # Ctrl+C는 무시
             sys.__excepthook__(exc_type, exc_value, exc_traceback)
             return
         
-        import traceback
         error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
         
         # 파일에 저장
@@ -1505,15 +1507,15 @@ class MainWindow(QMainWindow):
         risk_layout = QFormLayout()
         
         # 손절
-        self.input_stop_loss = QLineEdit("-2.0")
-        self.input_stop_loss.setPlaceholderText("예: -2.0")
-        desc_stop = QLabel("📉 설정된 손절율에 도달하면 자동으로 매도하여 추가 손실을 방지합니다.")
+        self.input_stop_loss = QLineEdit("2.0")
+        self.input_stop_loss.setPlaceholderText("예: 2.0")
+        desc_stop = QLabel("📉 설정한 비율만큼 손실이 발생하면 자동으로 매도하여 추가 손실을 방지합니다. (양수 입력)")
         desc_stop.setStyleSheet("color: #666; font-size: 11px; margin-bottom: 5px;")
         
         # 익절
         self.input_take_profit = QLineEdit("5.0")
         self.input_take_profit.setPlaceholderText("예: 5.0")
-        desc_take = QLabel("💰 설정된 익절율에 도달하면 수익을 확정하기 위해 자동으로 매도합니다.")
+        desc_take = QLabel("💰 설정한 비율만큼 수익이 발생하면 수익을 확정하기 위해 자동으로 매도합니다. (양수 입력)")
         desc_take.setStyleSheet("color: #666; font-size: 11px; margin-bottom: 5px;")
         
         risk_layout.addRow("손절율 (%):", self.input_stop_loss)
@@ -1659,6 +1661,18 @@ class MainWindow(QMainWindow):
             stop = float(self.input_stop_loss.text().strip())
             take = float(self.input_take_profit.text().strip())
             
+            # 입력 값 검증
+            if stop <= 0:
+                QMessageBox.warning(self, "오류", "손절율은 양수로 입력해주세요. (예: 2.0)")
+                return
+            if take <= 0:
+                QMessageBox.warning(self, "오류", "익절율은 양수로 입력해주세요. (예: 5.0)")
+                return
+            
+            # 손절율은 시스템 내부에서 자동으로 음수로 변환
+            stop = -abs(stop)
+            take = abs(take)
+            
             if k > 1.0:
                 reply = QMessageBox.question(self, "확인", f"K값({k})이 1.0보다 큽니다. 계속하시겠습니까?", QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.No: return
@@ -1725,7 +1739,8 @@ class MainWindow(QMainWindow):
         
         # 기본 전략 파라미터
         if 'k' in params: self.input_k_value.setText(str(params['k']))
-        if 'stop_loss' in params: self.input_stop_loss.setText(str(params['stop_loss']))
+        # 손절율은 절대값으로 표시 (음수 제거)
+        if 'stop_loss' in params: self.input_stop_loss.setText(str(abs(params['stop_loss'])))
         if 'take_profit' in params: self.input_take_profit.setText(str(params['take_profit']))
         
         # 스캔 설정 파라미터 (입력 필드는 삭제됨, 프로필만 복원)
