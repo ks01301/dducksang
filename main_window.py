@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QTableWidget, 
     QTableWidgetItem, QGroupBox, QMessageBox, QHeaderView, QTabWidget,
     QFormLayout, QFrame, QComboBox, QStackedWidget, QSpacerItem, QSizePolicy,
-    QCheckBox, QCompleter
+    QCheckBox, QCompleter, QFileDialog
 )
 from PyQt5.QtCore import Qt, pyqtSlot, QTimer, QTime, QEvent
 from PyQt5.QtGui import QFont
@@ -72,6 +72,11 @@ class MainWindow(QMainWindow):
         
         # [NEW] 초기 전략 정보 반영
         self.refresh_strategy_info()
+        
+        # [NEW] 매매 실행 타이머 (장중 3초마다)
+        self.trading_timer = QTimer(self)
+        self.trading_timer.timeout.connect(self.run_strategy_cycle)
+        self.trading_timer.start(3000)  # 3초마다 매매 로직 실행
     
     def init_ui(self):
         """UI 초기화"""
@@ -1415,9 +1420,14 @@ class MainWindow(QMainWindow):
         # GUI에 표시
         self.text_log.append(log_line)
         
-        # 파일에 저장
+        # 파일에 저장 (이모지 오류 방지)
         if hasattr(self, 'file_logger'):
-            self.file_logger.info(message)
+            try:
+                self.file_logger.info(message)
+            except UnicodeEncodeError:
+                # 이모지 제거 후 다시 시도
+                clean_msg = message.encode('ascii', 'ignore').decode('ascii')
+                self.file_logger.info(clean_msg)
 
     def create_manual_watchlist_group(self):
         """수동 관리 종목 UI 생성"""
@@ -1544,7 +1554,7 @@ class MainWindow(QMainWindow):
             "볼린저 밴드 돌파 (Vola)", 
             "사용자 정의"
         ])
-        self.combo_scan_profile.currentIndexChanged.connect(self.refresh_strategy_info)
+        # [FIX] 프로필 변경 시에는 설명만 업데이트 (저장은 수동)
         self.combo_scan_profile.currentIndexChanged.connect(self.update_scan_profile_desc)
         
         form_layout.addRow(self.chk_auto_scan)
@@ -1560,7 +1570,35 @@ class MainWindow(QMainWindow):
         discovery_group.setLayout(discovery_layout)
         layout.addWidget(discovery_group)
 
-        # 3. 설정 저장 버튼
+        # 4. 데이터베이스 백업/복원
+        db_group = QGroupBox("데이터베이스 분백 관리")
+        db_layout = QVBoxLayout()
+        
+        desc_db = QLabel(
+            "💾 거래 내역, 설정, 자산 정보를 백업하고 다른 환경에서 복원할 수 있습니다.\n"
+            "⚠️ 복원 시 기존 데이터가 덮어쓰기됩니다. 주의하세요!"
+        )
+        desc_db.setStyleSheet("color: #666; font-size: 11px; margin-bottom: 10px;")
+        desc_db.setWordWrap(True)
+        db_layout.addWidget(desc_db)
+        
+        btn_layout = QHBoxLayout()
+        
+        btn_export_db = QPushButton("📤 백업 (Export)")
+        btn_export_db.setStyleSheet("height: 40px; background-color: #28a745; color: white; font-weight: bold;")
+        btn_export_db.clicked.connect(self.export_database)
+        btn_layout.addWidget(btn_export_db)
+        
+        btn_import_db = QPushButton("📥 복원 (Import)")
+        btn_import_db.setStyleSheet("height: 40px; background-color: #ffc107; color: black; font-weight: bold;")
+        btn_import_db.clicked.connect(self.import_database)
+        btn_layout.addWidget(btn_import_db)
+        
+        db_layout.addLayout(btn_layout)
+        db_group.setLayout(db_layout)
+        layout.addWidget(db_group)
+
+        # 5. 설정 저장 버튼
         btn_save_settings = QPushButton("설정 저장 (Save Settings)")
         btn_save_settings.setStyleSheet("height: 45px; background-color: #007bff; color: white; font-weight: bold; font-size: 14px;")
         btn_save_settings.clicked.connect(self.save_settings)
@@ -1732,6 +1770,98 @@ class MainWindow(QMainWindow):
             
         except ValueError:
             QMessageBox.warning(self, "오류", "유효한 숫자를 입력해주세요.")
+    
+    def export_database(self):
+        """데이터베이스 백업 (DB + 설정)"""
+        import shutil
+        import os
+        from datetime import datetime
+        
+        try:
+            # 기본 폴더명: backup_YYYYMMDD_HHMMSS
+            default_name = datetime.now().strftime("backup_%Y%m%d_%H%M%S")
+            
+            # 저장 폴더 선택
+            folder_path = QFileDialog.getExistingDirectory(
+                self,
+                "백업 폴더 선택",
+                "",
+                QFileDialog.ShowDirsOnly
+            )
+            
+            if folder_path:
+                # 백업 폴더 생성
+                backup_folder = os.path.join(folder_path, default_name)
+                os.makedirs(backup_folder, exist_ok=True)
+                
+                # trading.db 복사
+                if os.path.exists("trading.db"):
+                    shutil.copy2("trading.db", os.path.join(backup_folder, "trading.db"))
+                
+                # strategy.json 복사 (모든 파일)
+                for filename in os.listdir("."):
+                    if filename.startswith("strategy") and filename.endswith(".json"):
+                        shutil.copy2(filename, os.path.join(backup_folder, filename))
+                
+                self.log(f"[BACKUP] 백업 완료: {backup_folder}")
+                QMessageBox.information(
+                    self, 
+                    "백업 성공", 
+                    f"데이터베이스와 설정이 성공적으로 백업되었습니다.\n\n폴더: {backup_folder}"
+                )
+        except Exception as e:
+            self.log(f"[ERROR] 백업 실패: {e}")
+            QMessageBox.critical(self, "백업 실패", f"백업 중 오류가 발생했습니다:\n{e}")
+    
+    def import_database(self):
+        """데이터베이스 복원"""
+        """데이터베이스 복원"""
+        import shutil
+        
+        # 경고 메시지
+        reply = QMessageBox.warning(
+            self,
+            "경고",
+            "⚠️ 데이터베이스를 복원하면 현재 모든 데이터가 삭제됩니다.\n\n계속하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        try:
+            # 복원할 폴더 선택
+            import os
+            folder_path = QFileDialog.getExistingDirectory(
+                self,
+                "백업 폴더 선택",
+                "",
+                QFileDialog.ShowDirsOnly
+            )
+            
+            if folder_path:
+                # trading.db 복원
+                db_path = os.path.join(folder_path, "trading.db")
+                if os.path.exists(db_path):
+                    shutil.copy2(db_path, "trading.db")
+                
+                # strategy.json 파일들 복원
+                for filename in os.listdir(folder_path):
+                    if filename.startswith("strategy") and filename.endswith(".json"):
+                        src = os.path.join(folder_path, filename)
+                        shutil.copy2(src, filename)
+                
+                self.log(f"[RESTORE] 복원 완료: {folder_path}")
+                QMessageBox.information(
+                    self,
+                    "복원 성공",
+                    "데이터베이스와 설정이 성공적으로 복원되었습니다.\n\n"
+                    "프로그램을 다시 시작하면 복원된 데이터를 사용할 수 있습니다."
+                )
+        except Exception as e:
+            self.log(f"[ERROR] 복원 실패: {e}")
+            QMessageBox.critical(self, "복원 실패", f"복원 중 오류가 발생했습니다:\n{e}")
 
     def refresh_settings_ui(self):
         """전략 설정을 UI에 반영 (로그인 후 호출)"""
@@ -1811,11 +1941,6 @@ class MainWindow(QMainWindow):
         else:
             status = "장 중 (실시간)"
             color = "#4CAF50"  # Green
-            
-            # 자동매매가 켜져 있을 때만 실제 로직 수행 예정
-            # 자동매매가 켜져 있을 때만 실제 로직 수행 예정
-            if self.is_trading_active:
-                self.run_strategy_cycle()
 
         self.lbl_market_status.setText(status)
         self.lbl_market_status.setStyleSheet(f"background-color: {color}; color: white; padding: 5px; border-radius: 3px; font-weight: bold;")
@@ -2070,11 +2195,15 @@ class MainWindow(QMainWindow):
             profile = self.combo_scan_profile.currentText()
             type_name = "거래량급증" if trcode == "opt10032" else "가격급발동"
             
-            # 1차 필터: 거래량 급증 기준 (프로필별 초기값)
-            try:
-                min_vol = float(self.input_min_vol_rate.text())
-            except:
-                min_vol = 500.0
+            # [FIX] 1차 필터: 프로필별 고정 기준값 사용
+            if "전고점 돌파" in profile:
+                min_vol, min_price = 500.0, 5.0
+            elif "정배열" in profile:
+                min_vol, min_price = 150.0, 2.0
+            elif "볼린저" in profile:
+                min_vol, min_price = 200.0, 3.0
+            else:  # 사용자 정의
+                min_vol, min_price = 100.0, 1.0
             
             passed_count = 0
             for item in results:
