@@ -36,3 +36,15 @@ test_*.db
 
 /backup*
 /logs
+
+# PyInstaller
+/build
+/dist
+*.spec
+
+# Inno Setup
+/installer_output
+/Output
+
+# Release
+/release
