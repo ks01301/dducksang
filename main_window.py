@@ -781,6 +781,22 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def refresh_asset_status(self):
         """자산 현황 새로고침"""
+        # [NEW] 로그인 상태일 때 계좌 잔고 자동 조회
+        if self.kiwoom and self.kiwoom.get_connect_state() == 1 and hasattr(self, 'lbl_total_deposit'):
+            account_no = self.label_account.text()
+            if account_no and account_no != "-":
+                try:
+                    balance_data = self.kiwoom.get_account_balance(account_no)
+                    raw_deposit = balance_data.get('예수금', '0').strip().replace(',', '')
+                    raw_d2 = balance_data.get('d+2추정예수금', '0').strip().replace(',', '')
+                    deposit = int(raw_deposit) if raw_deposit else 0
+                    d2_deposit = int(raw_d2) if raw_d2 else 0
+                    self.current_d2_deposit = d2_deposit
+                    self.lbl_total_deposit.setText(f"{deposit:,}원")
+                    self.lbl_available_deposit.setText(f"{d2_deposit:,}원")
+                except:
+                    pass
+        
         summary = self.asset_manager.get_summary()
         
         current_capital = summary['현재_운용금액']

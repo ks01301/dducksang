@@ -33,3 +33,5 @@ Thumbs.db
 # 테스트 파일
 test_*.json
 test_*.db
+
+/backup*
