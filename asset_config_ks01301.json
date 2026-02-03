@@ -1,10 +1,10 @@
 {
-  "initial_capital": 2100012,
-  "current_capital": 2100012,
-  "available_cash": 2100012,
+  "initial_capital": 8000000,
+  "current_capital": 8000000,
+  "available_cash": 8000000,
   "holdings_value": 0,
   "total_profit": 0,
   "profit_rate": 0.0,
-  "max_stock_amount": 123,
-  "last_updated": "2026-02-03 23:28:49"
+  "max_stock_amount": 0,
+  "last_updated": "2026-02-04 00:24:44"
 }

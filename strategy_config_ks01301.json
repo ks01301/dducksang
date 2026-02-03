@@ -1,10 +1,10 @@
 {
   "params": {
-    "k": 0.5,
+    "k": 0.6,
     "stop_loss": -2.0,
     "take_profit": 5.0,
-    "min_vol": 200.0,
-    "min_price": 3.0,
+    "min_vol": 500.0,
+    "min_price": 5.0,
     "auto_scan": true,
     "profile": "전고점 돌파 (Breakout)"
   },
