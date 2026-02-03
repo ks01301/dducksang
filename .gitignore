@@ -35,3 +35,4 @@ test_*.json
 test_*.db
 
 /backup*
+/logs
