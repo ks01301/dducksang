@@ -15,9 +15,8 @@ from core.database import Database
 from logic.asset_manager import AssetManager
 from logic.strategy import Strategy, VolatilityBreakoutStrategy
 from logic.trading_manager import TradingManager
+from core.version import VERSION, APP_NAME
 import sqlite3
-
-VERSION = "1.0.0"
 
 class MainWindow(QMainWindow):
     """메인 윈도우 클래스"""
@@ -86,7 +85,7 @@ class MainWindow(QMainWindow):
 
     def init_ui(self):
         """UI 초기화"""
-        self.setWindowTitle(f"떡상기원 Ver {VERSION}")
+        self.setWindowTitle(f"{APP_NAME} Ver {VERSION}")
         self.setGeometry(100, 100, 1200, 1000)
         
         # 스택 위젯 생성 (0: 로그인, 1: 메인 앱)
@@ -1932,7 +1931,7 @@ class MainWindow(QMainWindow):
         self.update_scan_profile_desc(0)
         
         # 버전 정보 표시
-        version_label = QLabel(f"떡상기원 Ver {VERSION}")
+        version_label = QLabel(f"{APP_NAME} Ver {VERSION}")
         version_label.setAlignment(Qt.AlignRight | Qt.AlignBottom)
         version_label.setStyleSheet("color: #999; font-size: 12px; margin: 10px;")
         layout.addWidget(version_label)
