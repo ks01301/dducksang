@@ -57,6 +57,16 @@ class TradingManager(QObject):
                 buy_price = int(target_holding['매입가'])
                 qty = int(target_holding['보유수량'])
                 
+                # [NEW] 봇 매수 종목인지 확인 (사용자 보유분 매도 방지)
+                bot_stocks = self.db.get_bot_stock_codes()
+                # code: A, Q... 접두사 제거 등 정규화 필요할 수 있음 (보통 6자리)
+                clean_code = code.strip()
+                if len(clean_code) > 6: clean_code = clean_code[-6:]
+
+                if clean_code not in bot_stocks:
+                    # 봇이 산 종목이 아니면 건너뜀 (로그 생략 or 디버그용)
+                    return
+
                 if qty > 0 and buy_price > 0:
                     profit_rate = (current_price - buy_price) / buy_price * 100
                     
@@ -68,13 +78,6 @@ class TradingManager(QObject):
                          target_one = self.strategy.target_prices[code]
                          if current_price >= target_one:
                              self.sig_log.emit(f"⚡ [즉시익절] {code} 목표가({target_one}) 도달! (현재: {current_price}) -> 매도실행")
-                             self.kiwoom.send_order(2, code, qty, 0, "ACC_NO_PLACEHOLDER") # MainWindow에서 계좌번호 주입 필요? 
-                             # 수정: 계좌번호는 TradingManager가 알고 있거나 인자로 받아야 함. 
-                             # 일단 간단히 kiwoom.account_holdings가 있으면 계좌번호도 알 수 있음.
-                             # 여기서는 Kiwoom 클래스가 계좌번호를 관리하지 않으므로, 추후 보완.
-                             # 임시: strategy나 asset_manager에 계좌번호가 있나? Main이 관리함.
-                             # 해결: send_order 호출 시 계좌번호가 필요한데... 
-                             # 일단 self.kiwoom에 account_list가 있으므로 첫번째 계좌 사용 (개선 포인트)
                              if self.kiwoom.account_list:
                                 acc = self.kiwoom.account_list[0]
                                 self.kiwoom.send_order(2, code, qty, 0, acc)
@@ -147,16 +150,41 @@ class TradingManager(QObject):
                 try:
                     filled_qty = int(data.get('체결수량', 0))
                     if filled_qty > 0:
-                        price = abs(int(data.get('체결가격', 0)))
+                        sell_price = abs(int(data.get('체결가격', 0)))
                         name = data['종목명'].strip()
-                        self.db.save_trade(stock_code, name, "매도", price, filled_qty)
+                        
+                        # [FIX] 매수 단가 추적 (수익 산출용)
+                        buy_price = 0
+                        
+                        # 1. Kiwoom 보유 종목에서 찾기
+                        if self.kiwoom.account_holdings:
+                            for h in self.kiwoom.account_holdings:
+                                h_code = h['종목코드'].strip()
+                                if len(h_code) > 6: h_code = h_code[-6:]
+                                if h_code == stock_code:
+                                    buy_price = int(h.get('매입가', 0))
+                                    break
+                                    
+                        # 2. 못 찾으면 DB나 추정치 사용 (fallback) -> 여기선 안전하게 0이면 sell_price로 가정 (수익 0)
+                        if buy_price == 0:
+                            self.sig_log.emit(f"⚠️ [주의] {name} 매입가를 찾을 수 없어 수익 0원으로 가정합니다.")
+                            buy_price = sell_price
+
+                        buy_amount = buy_price * filled_qty
+                        sell_amount = sell_price * filled_qty
+                        
+                        # DB 저장
+                        self.db.save_trade(stock_code, name, "매도", sell_price, filled_qty)
                         
                         # 자산 환원 (AssetManager)
-                        total_amount = price * filled_qty
-                        self.asset_manager.release_cash_after_sell(total_amount)
+                        # [FIX] register_sell(원금, 매도금액) 호출 -> 이익/손실 자동 계산 및 재투자 재원으로 환원
+                        self.asset_manager.register_sell(buy_amount, sell_amount)
                         
                         self.sig_trade_event.emit()
-                        self.sig_log.emit(f"📉 [매도체결] {name} {filled_qty}주 정산 완료")
+                        
+                        profit = sell_amount - buy_amount
+                        self.sig_log.emit(f"📉 [매도체결] {name} {filled_qty}주 정산 완료 (손익: {profit:,}원)")
+
                 except Exception as e:
                     self.sig_log.emit(f"❌ 매도 체결 처리 오류: {e}")
 
@@ -175,7 +203,10 @@ class TradingManager(QObject):
                     return "REMOVE" # 목록 제거 신호
             except: pass
             
-            if strength < 100.0: return None # 체결강도 약함
+            # [FIX] 하드코딩된 100.0 대신 사용자 설정값 사용
+            min_intensity = self.strategy.params.get('min_intensity', 100.0)
+            if strength < min_intensity: 
+                return None # 체결강도 약함 (사용자 설정 기준 미달)
 
             # 2. 주문 실행
             account = self.kiwoom.account_list[0] if self.kiwoom.account_list else ""
@@ -199,9 +230,6 @@ class TradingManager(QObject):
         return None
 
     def calculate_order_qty(self, price):
-        """주문 수량 계산"""
-        # AssetManager의 '1회 매수 금액' 사용 권장하지만, 간단히 여기서 계산 or AssetManager에 위임
-        # 여기서는 MainWindow 로직을 가져옴
-        one_time_amount = self.asset_manager.one_time_invest_amount
+        """주문 수량 계산 (AssetManager 위임)"""
         if price <= 0: return 0
-        return int(one_time_amount // price)
+        return self.asset_manager.calculate_order_qty(price)

@@ -46,6 +46,7 @@ class Kiwoom(QObject):
         self.data = {}
         self.account_holdings = []
         self.account_summary = {}
+        self.account_list = [] # [NEW] 계좌번호 리스트
         self.login_err_code = None
         
         # [NEW] Rate Limiting (요청 제한)
@@ -57,8 +58,29 @@ class Kiwoom(QObject):
     
     def _connect_events(self):
         """이벤트 핸들러 연결"""
+        # [CHECK] 32비트 Python 환경 확인
+        if sys.maxsize > 2**32:
+            error_msg = (
+                "❌ [키움API 오류] 64비트 Python 환경에서는 실행할 수 없습니다.\n"
+                "키움증권 Open API는 32비트 프로그램이므로, 반드시 '32비트 Python'으로 실행해야 합니다.\n\n"
+                "현재 환경: 64비트"
+            )
+            print(error_msg)
+            raise Exception(error_msg)
+
         # 로그인 이벤트
-        self.ocx.OnEventConnect.connect(self._on_event_connect)
+        try:
+            self.ocx.OnEventConnect.connect(self._on_event_connect)
+        except AttributeError:
+             error_msg = (
+                "❌ [키움API 오류] 키움 Open API 컨트롤을 찾을 수 없습니다.\n"
+                "1. 키움증권 Open API+가 설치되어 있는지 확인하세요.\n"
+                "2. 32비트 Python 환경인지 다시 확인하세요.\n"
+                "3. 관리자 권한으로 실행해 보세요."
+            )
+             print(error_msg)
+             raise Exception(error_msg)
+
         # TR 데이터 수신 이벤트
         self.ocx.OnReceiveTrData.connect(self._on_receive_tr_data)
         # 주문 체결 이벤트
@@ -452,7 +474,8 @@ class Kiwoom(QObject):
         self.data['일봉'] = []
         
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "종목코드", stock_code)
-        self.ocx.dynamicCall("SetInputValue(QString, QString)", "기준일자", date)
+        # [FIX] date가 None이면 빈 문자열로 변환 (오늘 날짜 기준 조회)
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "기준일자", date if date else "")
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
         
         self._wait_rate_limit() # [NEW] 과부하 방지

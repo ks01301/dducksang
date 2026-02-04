@@ -5,76 +5,98 @@ class Strategy(QObject):
     # 로그 메시지 발생 시그널
     log_msg = pyqtSignal(str)
     
-    def __init__(self, kiwoom, asset_manager):
+    def __init__(self, kiwoom, asset_manager, db=None):
         super().__init__()
         self.kiwoom = kiwoom
         self.asset_manager = asset_manager
+        self.db = db
+        self.user_id = None
         self.params = {
             'k': 0.5,
             'stop_loss': -2.0, 
-            'take_profit': 5.0
+            'take_profit': 5.0,
+            'min_vol': 100000,
+            'confirm_count': 3
         }
         self.universe = []         # 감시 대상 전체 종목 리스트
-        self.manual_universe = []  # 사용자가 직접 추가한 종목 리스트 (영구 저장용)
+        self.auto_universe = {}    # {code: strategy_name}
         self.config_file = None
 
     def load_config(self, user_id):
-        """사용자별 전략 설정 로드"""
+        """사용자별 전략 설정 로드 (DB 우선, JSON 마이그레이션 포함)"""
         import json
         import os
+        self.user_id = user_id
         self.config_file = f"strategy_config_{user_id}.json"
-        self.auto_universe = {} # {code: strategy_name}
         
+        # 1. DB에서 먼저 시도
+        if self.db:
+            config = self.db.get_strategy_config(user_id)
+            if config:
+                if config.get('params'):
+                    self.params.update(config['params'])
+                if config.get('universe'):
+                    self.auto_universe = config['universe']
+                    for code in self.auto_universe:
+                        if code not in self.universe:
+                            self.universe.append(code)
+                self.log_msg.emit(f"⚙️ 전략 설정 로드 완료 (DB): {user_id} (자동 {len(self.auto_universe)}개 종목)")
+                
+                # DB 로드 성공 시 JSON이 있다면 삭제 (마이그레이션 완료로 간주)
+                if os.path.exists(self.config_file):
+                    try:
+                        os.remove(self.config_file)
+                        self.log_msg.emit(f"🧹 기존 JSON 설정 파일 삭제 완료 (DB 이관 완료)")
+                    except: pass
+                return
+
+        # 2. DB에 데이터가 없거나 DB를 못 쓸 경우 JSON 검색 (마이그레이션)
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     
-                    # 1. 파라미터 로드
                     if 'params' in data:
                         self.params.update(data['params'])
                     else:
                         self.params.update(data)
-                        
-                    # 2. 수동 유니버스 로드
-                    if 'manual_universe' in data:
-                        self.manual_universe = data['manual_universe']
-                        for code in self.manual_universe:
-                            if code not in self.universe:
-                                self.universe.append(code)
                     
-                    # 3. 자동 유니버스 로드
                     if 'auto_universe' in data:
                         self.auto_universe = data['auto_universe']
                         for code in self.auto_universe:
                             if code not in self.universe:
                                 self.universe.append(code)
                                 
-                self.log_msg.emit(f"⚙️ 전략 설정 로드 완료: {user_id} (수동 {len(self.manual_universe)} / 자동 {len(self.auto_universe)})")
+                self.log_msg.emit(f"⚙️ 전략 설정 로드 완료 (JSON → DB 이관 예정): {user_id}")
+                
+                # 로드한 즉시 DB에 저장하여 마이그레이션 수행
+                self.save_config()
+                
             except Exception as e:
-                self.log_msg.emit(f"⚠️ 전략 설정 로드 실패: {e}")
+                self.log_msg.emit(f"⚠️ 전략 설정 로드 실패 (JSON): {e}")
 
     def save_config(self):
-        """전략 설정 저장"""
-        import json
-        if not self.config_file:
+        """전략 설정 저장 (DB 전용)"""
+        if not self.user_id:
             return
             
         try:
-            data = {
-                'params': self.params,
-                'manual_universe': self.manual_universe,
-                'auto_universe': getattr(self, 'auto_universe', {})
-            }
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            if self.db:
+                self.db.save_strategy_config(self.user_id, self.params, self.auto_universe)
+                # self.log_msg.emit(f"💾 전략 설정 DB 저장 완료")
+            else:
+                # DB가 없는 비상 상황용 (거의 없음)
+                import json
+                data = {'params': self.params, 'auto_universe': self.auto_universe}
+                with open(self.config_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self.log_msg.emit(f"⚠️ 전략 설정 저장 실패: {e}")
     
     def update_params(self, params):
         self.params.update(params)
         self.log_msg.emit(f"⚙️ 전략 파라미터 업데이트: {self.params}")
-        self.save_config()  # 변경 즉시 저장
+        self.save_config()  # 변경 즉시 저장 (DB)
 
     def run(self):
         """주기적으로 실행되는 메인 로직"""
@@ -157,8 +179,8 @@ class Strategy(QObject):
 
 class VolatilityBreakoutStrategy(Strategy):
     """변동성 돌파 전략"""
-    def __init__(self, kiwoom, asset_manager):
-        super().__init__(kiwoom, asset_manager)
+    def __init__(self, kiwoom, asset_manager, db=None):
+        super().__init__(kiwoom, asset_manager, db=db)
         self.target_prices = {}  # 종목별 목표 매수가
 
     def set_universe(self, codes):

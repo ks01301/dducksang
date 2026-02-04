@@ -69,9 +69,103 @@ class Database:
             )
         ''')
         
+        # 3. asset_config 테이블 (자산 설정)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS asset_config (
+                user_id TEXT PRIMARY KEY,
+                initial_capital INTEGER DEFAULT 0,
+                realized_profit INTEGER DEFAULT 0,
+                invested_amount INTEGER DEFAULT 0,
+                max_stock_amount INTEGER DEFAULT 0,
+                updated_at TEXT
+            )
+        ''')
+        
+        # 4. strategy_config 테이블 (전략 설정)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS strategy_config (
+                user_id TEXT PRIMARY KEY,
+                params_json TEXT,
+                universe_json TEXT,
+                updated_at TEXT
+            )
+        ''')
+        
         self.conn.commit()
         print("✅ 테이블 생성 완료")
+
+    # ========== 자산 설정 관리(Migration) ==========
+
+    def get_asset_config(self, user_id: str) -> Optional[Dict]:
+        """자산 설정 조회"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM asset_config WHERE user_id=?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+        except Exception as e:
+            print(f"❌ 자산 설정 조회 실패: {e}")
+            return None
+
+    def save_asset_config(self, user_id: str, data: Dict):
+        """자산 설정 저장 (Upsert)"""
+        try:
+            cursor = self.conn.cursor()
+            
+            updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO asset_config 
+                (user_id, initial_capital, realized_profit, invested_amount, max_stock_amount, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id,
+                data.get('initial_capital', 0),
+                data.get('realized_profit', 0),
+                data.get('invested_amount', 0),
+                data.get('max_stock_amount', 0),
+                updated_at
+            ))
+            self.conn.commit()
+        except Exception as e:
+            print(f"❌ 자산 설정 저장 실패: {e}")
     
+    def get_strategy_config(self, user_id: str) -> Optional[Dict]:
+        """전략 설정 조회"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM strategy_config WHERE user_id=?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                import json
+                return {
+                    'params': json.loads(row['params_json']) if row['params_json'] else {},
+                    'universe': json.loads(row['universe_json']) if row['universe_json'] else {}
+                }
+            return None
+        except Exception as e:
+            print(f"❌ 전략 설정 조회 실패: {e}")
+            return None
+
+    def save_strategy_config(self, user_id: str, params: Dict, universe: Dict):
+        """전략 설정 저장 (Upsert)"""
+        try:
+            import json
+            cursor = self.conn.cursor()
+            params_json = json.dumps(params, ensure_ascii=False)
+            universe_json = json.dumps(universe, ensure_ascii=False)
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO strategy_config (user_id, params_json, universe_json, updated_at)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, params_json, universe_json, now))
+            self.conn.commit()
+        except Exception as e:
+            print(f"❌ 전략 설정 저장 실패: {e}")
+
     # ========== 매매 기록 관리 ==========
     
     def save_trade(self, stock_code: str, stock_name: str, trade_type: str,
@@ -304,6 +398,21 @@ class Database:
         if self.conn:
             self.conn.close()
             print("✅ 데이터베이스 연결 종료")
+    
+    def get_bot_stock_codes(self) -> set:
+        """
+        봇이 매수한 기록이 있는 종목 코드 집합 반환
+        (사용자 직접 매수 종목과 구분하기 위함)
+        """
+        try:
+            cursor = self.conn.cursor()
+            # 매수 기록이 있는 종목만 중복 제거하여 조회
+            cursor.execute("SELECT DISTINCT stock_code FROM trade_log WHERE trade_type='매수'")
+            rows = cursor.fetchall()
+            return {row['stock_code'] for row in rows}
+        except Exception as e:
+            print(f"❌ 봇 매수 종목 조회 실패: {e}")
+            return set()
     
     def clear_all(self):
         """모든 데이터 삭제 (주의!)"""

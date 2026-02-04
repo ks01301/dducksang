@@ -48,3 +48,5 @@ test_*.db
 
 # Release
 /release
+
+/docs

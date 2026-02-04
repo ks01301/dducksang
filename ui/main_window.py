@@ -9,8 +9,7 @@ from PyQt5.QtWidgets import (
     QCheckBox, QCompleter, QFileDialog
 )
 from PyQt5.QtCore import Qt, pyqtSlot, QTimer, QTime, QEvent
-from PyQt5.QtGui import QFont
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QColor
 from core.kiwoom import Kiwoom
 from core.database import Database
 from logic.asset_manager import AssetManager
@@ -30,11 +29,11 @@ class MainWindow(QMainWindow):
         self.kiwoom = None
         
         # 자산 관리자 및 데이터베이스
-        self.asset_manager = AssetManager()
         self.db = Database()
+        self.asset_manager = AssetManager(db=self.db)
         
         # 전략 초기화
-        self.strategy = VolatilityBreakoutStrategy(self.kiwoom, self.asset_manager)
+        self.strategy = VolatilityBreakoutStrategy(self.kiwoom, self.asset_manager, db=self.db)
         self.strategy.log_msg.connect(self.log)
         
         # 자동매매 상태 변수
@@ -77,6 +76,14 @@ class MainWindow(QMainWindow):
         # [NEW] 초기 전략 정보 반영
         self.refresh_strategy_info()
     
+    def format_min_vol_input(self):
+        """최소 거래량 입력 시 콤마 자동 포맷팅"""
+        text = self.input_min_vol.text().replace(',', '')
+        if text.isdigit():
+            formatted = "{:,}".format(int(text))
+            if formatted != self.input_min_vol.text():
+                self.input_min_vol.setText(formatted)
+
     def init_ui(self):
         """UI 초기화"""
         self.setWindowTitle(f"떡상기원 Ver {VERSION}")
@@ -265,8 +272,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(strategy_info_group)
         
         # 0.7. 감시 종목 (Separated Universe)
-        manual_watchlist_group = self.create_manual_watchlist_group()
-        layout.addWidget(manual_watchlist_group)
+        
+        # 0.7. 감시 종목 (Separated Universe)
+        # [REMOVED] 수동 감시 종목 기능 삭제 (User Request)
+        # manual_watchlist_group = self.create_manual_watchlist_group()
+        # layout.addWidget(manual_watchlist_group)
         
         auto_watchlist_group = self.create_auto_watchlist_group()
         layout.addWidget(auto_watchlist_group)
@@ -308,12 +318,12 @@ class MainWindow(QMainWindow):
         account_layout = QGridLayout()
         account_group.setStyleSheet("QGroupBox { font-weight: bold; color: #444; }")
         
-        account_layout.addWidget(QLabel("총 예수금:", styleSheet="font-size: 14px;"), 0, 0)
-        self.lbl_total_deposit = QLabel("-", styleSheet="font-size: 16px; font-weight: bold;")
+        account_layout.addWidget(QLabel("[A] 총 추정자산 (D+2+보유):", styleSheet="font-size: 14px;"), 0, 0)
+        self.lbl_total_deposit = QLabel("로딩중...", styleSheet="font-size: 16px; font-weight: bold;")
         account_layout.addWidget(self.lbl_total_deposit, 0, 1)
         
-        account_layout.addWidget(QLabel("주문 가능 (D+2):", styleSheet="font-size: 14px; color: blue;"), 1, 0)
-        self.lbl_available_deposit = QLabel("-", styleSheet="font-size: 16px; font-weight: bold; color: blue;")
+        account_layout.addWidget(QLabel("주문 가능 현금 (D+2):", styleSheet="font-size: 14px; color: blue;"), 1, 0)
+        self.lbl_available_deposit = QLabel("로딩중...", styleSheet="font-size: 16px; font-weight: bold; color: blue;")
         account_layout.addWidget(self.lbl_available_deposit, 1, 1)
         
         # 계좌 잔고 불러오기 버튼
@@ -327,13 +337,13 @@ class MainWindow(QMainWindow):
         
         
         # 2. 봇 운용 자금 설정 (AssetManager)
-        setting_group = QGroupBox("봇 운용 자금 관리")
+        setting_group = QGroupBox("자금 관리")
         setting_layout = QVBoxLayout()
         setting_group.setStyleSheet("QGroupBox { font-weight: bold; color: #444; }")
         
         # [NEW] 현재 운용 설정액 표시 (크게)
         current_cap_layout = QHBoxLayout()
-        current_cap_layout.addWidget(QLabel("🤖 현재 봇이 운용 중인 자금:", styleSheet="font-size: 14px;"))
+        current_cap_layout.addWidget(QLabel("운용 자금 설정:", styleSheet="font-size: 14px;"))
         self.lbl_bot_capital_setting = QLabel("0원", styleSheet="font-size: 20px; font-weight: bold; color: #E04F5F;")
         current_cap_layout.addWidget(self.lbl_bot_capital_setting)
         current_cap_layout.addStretch()
@@ -341,7 +351,7 @@ class MainWindow(QMainWindow):
         
         # [NEW] 미운용 여유 자금 표시
         free_cap_layout = QHBoxLayout()
-        free_cap_layout.addWidget(QLabel("💤 봇이 건드리지 않는 여유 자금:", styleSheet="font-size: 14px;"))
+        free_cap_layout.addWidget(QLabel("[C] 여유 자금:", styleSheet="font-size: 14px;"))
         self.lbl_free_capital = QLabel("-", styleSheet="font-size: 16px; font-weight: bold; color: green;")
         free_cap_layout.addWidget(self.lbl_free_capital)
         free_cap_layout.addStretch()
@@ -415,39 +425,65 @@ class MainWindow(QMainWindow):
 
         
         setting_layout.addLayout(limit_layout)
-        setting_group.setLayout(setting_layout)
-        layout.addWidget(setting_group)
-        
+
         # 3. 자산 운용 현황 (통계)
-        status_group = QGroupBox("자산 운용 현황")
+        # 3. 자산 운용 현황 (통계) - 내부 GroupBox 제거하고 setting_layout에 평탄화
+        
+        # 구분선
+        line_status = QFrame()
+        line_status.setFrameShape(QFrame.HLine)
+        line_status.setFrameShadow(QFrame.Sunken)
+        setting_layout.addWidget(line_status)
+        
+        # 타이틀 (라벨로 대체)
+        lbl_status_title = QLabel("자산 운용 현황")
+        lbl_status_title.setStyleSheet("font-weight: bold; color: #444; font-size: 14px; margin-top: 10px; margin-bottom: 5px;")
+        setting_layout.addWidget(lbl_status_title)
+
         status_layout = QGridLayout()
-        status_group.setStyleSheet("QGroupBox { font-weight: bold; color: #444; }")
+        # status_group.setStyleSheet("QGroupBox { font-weight: bold; color: #444; }") # 제거됨
+        
+        status_layout = QGridLayout()
+        # status_group.setStyleSheet("QGroupBox { font-weight: bold; color: #444; }") # 제거됨
         
         idx_style = "font-size: 14px; color: gray;"
         val_style = "font-size: 18px; font-weight: bold;"
         
-        status_layout.addWidget(QLabel("현재 운용 자산", styleSheet=idx_style), 0, 0)
-        self.dash_current_capital = QLabel("-", styleSheet=val_style)
+        # [행 1] [B] 현재 운용 자산 (Total)
+        status_layout.addWidget(QLabel("[B] 현재 운용 자산", styleSheet=idx_style), 0, 0)
+        self.dash_current_capital = QLabel("로딩중...", styleSheet=val_style)
         status_layout.addWidget(self.dash_current_capital, 1, 0)
         
-        status_layout.addWidget(QLabel("매수 가능 현금", styleSheet=idx_style), 0, 1)
-        self.dash_available_cash = QLabel("-", styleSheet="font-size: 18px; font-weight: bold; color: blue;")
-        status_layout.addWidget(self.dash_available_cash, 1, 1)
+        # [행 1-2] [D] 자동 매수 금액 (Invested) -> [NEW]
+        status_layout.addWidget(QLabel("[D] 자동 매수 금액", styleSheet=idx_style), 0, 1)
+        self.dash_invested_amount = QLabel("0원", styleSheet="font-size: 18px; font-weight: bold; color: #E04F5F;")
+        status_layout.addWidget(self.dash_invested_amount, 1, 1)
+
+        # [행 2] [E] 매수 가능 현금 (Cash)
+        status_layout.addWidget(QLabel("[E] 매수 가능 현금", styleSheet=idx_style), 2, 0)
+        self.dash_available_cash = QLabel("로딩중...", styleSheet="font-size: 18px; font-weight: bold; color: blue;")
+        status_layout.addWidget(self.dash_available_cash, 3, 0)
         
-        status_layout.addWidget(QLabel("누적 수익금", styleSheet=idx_style), 2, 0)
-        self.dash_profit = QLabel("-", styleSheet=val_style)
-        status_layout.addWidget(self.dash_profit, 3, 0)
-        
+        # [행 2-2] 수익률 정보 (Optional) - 공간 부족시 아래로
         status_layout.addWidget(QLabel("총 수익률", styleSheet=idx_style), 2, 1)
-        self.dash_profit_rate = QLabel("-", styleSheet=val_style)
+        self.dash_profit_rate = QLabel("로딩중...", styleSheet=val_style)
         status_layout.addWidget(self.dash_profit_rate, 3, 1)
+
+        # [NEW Fix] 누적 수익금 표시 복구 (AttributeError 방지)
+        # 행 4에 추가 (공간 확보)
+        status_layout.addWidget(QLabel("누적 수익금", styleSheet=idx_style), 4, 0)
+        self.dash_profit = QLabel("0원", styleSheet=val_style)
+        status_layout.addWidget(self.dash_profit, 5, 0)
         
         btn_refresh_asset = QPushButton("현황 새로고침")
         btn_refresh_asset.clicked.connect(self.refresh_asset_status)
-        status_layout.addWidget(btn_refresh_asset, 4, 0, 1, 2)
+        status_layout.addWidget(btn_refresh_asset, 6, 0, 1, 2)
         
-        status_group.setLayout(status_layout)
-        layout.addWidget(status_group)
+        # status_group.setLayout(status_layout) # 제거됨
+        setting_layout.addLayout(status_layout) # 직접 추가
+        
+        setting_group.setLayout(setting_layout)
+        layout.addWidget(setting_group)
         
         layout.addStretch()
         self.tab_asset.setLayout(layout)
@@ -722,7 +758,8 @@ class MainWindow(QMainWindow):
             self.log(f"✅ 종목당 매수 한도 설정: {amount:,}원")
             QMessageBox.information(self, "성공", "매수 한도가 적용되었습니다.")
             self.refresh_asset_status()
-            self.input_max_stock.clear()
+            # self.input_max_stock.clear() # [FIX] 설정값 유지 (사용자가 0으로 오해하지 않도록)
+            self.input_max_stock.setText(f"{amount:,}")
         except ValueError:
              QMessageBox.warning(self, "오류", "숫자만 입력해주세요.")
 
@@ -769,87 +806,154 @@ class MainWindow(QMainWindow):
         self.lbl_strategy_params.setText(f"K: {k} | 손절: {stop}% | 익절: {take}%")
         
         # 종목 스캔 정보 반영
-        if hasattr(self, 'chk_auto_scan'):
-            is_scan_on = self.chk_auto_scan.isChecked()
-            profile = self.combo_scan_profile.currentText()
-            
-            if is_scan_on:
-                self.lbl_scan_status.setText("스캔: RUNNING")
-                self.lbl_scan_status.setStyleSheet("color: #4CAF50; font-weight: bold;") # 녹색
-                self.lbl_scan_profile.setText(f"| 프로필: {profile}")
-                self.lbl_scan_profile.show()
-            else:
-                self.lbl_scan_status.setText("스캔: OFF")
-                self.lbl_scan_status.setStyleSheet("color: #d9534f; font-weight: bold;") # 빨간색
-                self.lbl_scan_profile.hide()
+        # 종목 스캔 정보 반영
+        profile = self.combo_scan_profile.currentText()
         
-        self.log(f"ℹ️ 대시보드 갱신 (전략: K={k}/S={stop}% | 스캔: {'ON' if self.chk_auto_scan.isChecked() else 'OFF'})")
+        self.lbl_scan_status.setText("스캔: AUTO (Ready)")
+        self.lbl_scan_status.setStyleSheet("color: #007bff; font-weight: bold;") # 파란색 (대기중)
+        self.lbl_scan_profile.setText(f"| 프로필: {profile}")
+        self.lbl_scan_profile.show()
+    
+        self.log(f"ℹ️ 대시보드 갱신 (전략: K={k}/S={stop}% | 스캔: AUTO)")
+
+
 
     @pyqtSlot()
     def refresh_asset_status(self):
-        """자산 현황 새로고침"""
-        # [NEW] 로그인 상태일 때 계좌 잔고 자동 조회
-        real_d2_deposit = 0
-        if self.kiwoom and self.kiwoom.get_connect_state() == 1 and hasattr(self, 'lbl_total_deposit'):
+        """
+        자산 현황 새로고침 (Logic Fix v2)
+        A (총 추정자산) = API d+2추정예수금 + API 총평가금액
+        B (봇 운용자금) = AssetManager current_capital
+        C (여유 자금) = A - B
+        D (현재 운용자산) = AssetManager invested_amount
+        E (매수 가능현금) = AssetManager available_cash
+        """
+        # 로그인체크
+        if self.kiwoom is None or self.kiwoom.get_connect_state() != 1:
+            return
+
+        # 1. API 데이터 조회 (A 계산용)
+        d2_deposit = 0
+        total_eval = 0
+        
+        try:
             account_no = self.label_account.text()
             if account_no and account_no != "-":
-                try:
-                    balance_data = self.kiwoom.get_account_balance(account_no)
-                    raw_deposit = balance_data.get('예수금', '0').strip().replace(',', '')
-                    raw_d2 = str(balance_data.get('d+2추정예수금', '0')).strip().replace(',', '')
-                    deposit = int(raw_deposit) if raw_deposit else 0
-                    d2_deposit = int(raw_d2) if raw_d2 else 0
-                    real_d2_deposit = d2_deposit
-                    
-                    self.current_d2_deposit = d2_deposit
-                    self.lbl_total_deposit.setText(f"{deposit:,}원")
-                    self.lbl_available_deposit.setText(f"{d2_deposit:,}원")
-                    
-                    # [FIX] AssetManager와 API 데이터 동기화 (오차 보정)
-                    # API가 주는 D+2 예수금이 가장 정확한 '가용 현금'임
-                    if d2_deposit > 0:
-                        self.asset_manager.sync_balance(d2_deposit)
-                        
-                except:
-                    pass
-        
-        summary = self.asset_manager.get_summary()
-        
-        current_capital = summary['현재_운용금액']
-        
-        # 상단 설정액 표시 업데이트
-        self.lbl_bot_capital_setting.setText(f"{summary['초기_설정액']:,}원")
-        self.lbl_trading_tab_capital.setText(f"{summary['초기_설정액']:,}원")
-        
-        # 미운용 자금 계산 (계좌 정보가 있을 때만)
-        if hasattr(self, 'current_d2_deposit'):
-            free_money = self.current_d2_deposit - current_capital
-            self.lbl_free_capital.setText(f"{free_money:,}원")
-            if free_money < 0:
-                self.lbl_free_capital.setStyleSheet("font-size: 16px; font-weight: bold; color: red;")
-            else:
-                self.lbl_free_capital.setStyleSheet("font-size: 16px; font-weight: bold; color: green;")
-        
-        self.dash_current_capital.setText(f"{current_capital:,}원")
+                # 예수금 조회
+                balance_data = self.kiwoom.get_account_balance(account_no)
+                raw_d2 = str(balance_data.get('d+2추정예수금', '0')).strip().replace(',', '')
+                d2_deposit = int(raw_d2) if raw_d2 else 0
+                
+                # 총평가금액 (API)
+                raw_eval = str(self.kiwoom.data.get('총평가금액', '0')).strip().replace(',', '')
+                total_eval = int(raw_eval) if raw_eval else 0
+                
+                # [SYNC] 현재 보유 종목의 총 매입금액 계산 (D값 동기화) & 평가액 합산 (Fallback)
+                total_purchase_sum = 0
+                calc_total_eval = 0 # 테이블 기반 평가액 합계
+                
+                # [FIX] 봇 매수 종목 리스트 미리 조회
+                bot_stocks = self.db.get_bot_stock_codes()
 
-        # [FIX] 단순 계산값 대신 API 기반 값 우선 표시
-        display_cash = real_d2_deposit if real_d2_deposit > 0 else summary['가용_현금']
-        self.dash_available_cash.setText(f"{display_cash:,}원")
+                if self.table_holdings.rowCount() > 0:
+                    for r in range(self.table_holdings.rowCount()):
+                        try:
+                            # 2:수량, 3:매입가, 4:현재가 (인덱스 확인 필요) -> 실제로는 1:종목코드, 0:종목명 아님?
+                            # create_holdings_group에서의 설정:
+                            # 0:종목코드, 1:종목명, 2:보유수량, 3:매입가, 4:매수금액, 5:현재가...
+                            
+                            code = self.table_holdings.item(r, 0).text().strip()
+                            if code.startswith('A'): code = code[1:]
+                            
+                            qty_item = self.table_holdings.item(r, 2)
+                            buy_item = self.table_holdings.item(r, 3)
+                            curr_item = self.table_holdings.item(r, 5) # [Check] 5번이 현재가 맞나?
+                            
+                            if qty_item and buy_item and curr_item:
+                                qty = int(qty_item.text().replace(',', ''))
+                                buy_price = int(buy_item.text().replace(',', ''))
+                                curr_price = int(curr_item.text().replace(',', ''))
+                                
+                                # [NEW] 봇 매수 종목일 경우에만 [D] 합산에 포함
+                                if code in bot_stocks:
+                                    total_purchase_sum += (qty * buy_price)
+                                    calc_total_eval += (qty * curr_price)
+                        except: pass
+                
+                # API 총평가금액이 0이면 수동 합산값 사용
+                if total_eval == 0:
+                    total_eval = calc_total_eval
+                
+                # [FIX] 단순 합산이 아니라, 봇 관리 종목만 필터링한 값을 [D]로 설정
+                self.asset_manager.sync_invested_amount(total_purchase_sum)
+                
+                # [OLD] 전체 합산 로직 (주석 처리)
+                # if total_eval == 0: total_eval = calc_total_eval
+                # self.asset_manager.sync_invested_amount(total_purchase_sum)
+                
+                # trade_history = self.db.get_trade_history()
+                # self.asset_manager.smart_sync_invested_amount(holdings_list, trade_history)
+
+        except Exception as e:
+            self.log(f"⚠️ 자산 조회 중 오류: {e}")
+
+        # A: 총 추정자산
+        A_total_asset = d2_deposit + total_eval
         
-        self.dash_profit.setText(f"{summary['누적_수익금']:,}원")
+        # AssetManager 데이터 가져오기
+        summary = self.asset_manager.get_summary()
+        B_bot_capital = summary['현재_운용금액']
+        D_invested = summary['현재_운용자산']
+        E_available = summary['가용_현금']
         
-        profit_rate = summary['수익률']
-        self.dash_profit_rate.setText(f"{profit_rate:.2f}%")
+        # C: 여유 자금 (A - B)
+        C_free_capital = A_total_asset - B_bot_capital
         
-        # 색상 적용
-        if profit_rate > 0:
-            self.dash_profit_rate.setStyleSheet("font-size: 18px; font-weight: bold; color: red;")
-            self.dash_profit.setStyleSheet("font-size: 18px; font-weight: bold; color: red;")
-        elif profit_rate < 0:
-            self.dash_profit_rate.setStyleSheet("font-size: 18px; font-weight: bold; color: blue;")
-            self.dash_profit.setStyleSheet("font-size: 18px; font-weight: bold; color: blue;")
+        # UI 바인딩
+        if hasattr(self, 'lbl_total_deposit'):
+            self.lbl_total_deposit.setText(f"{A_total_asset:,}원")     # A
+            self.lbl_available_deposit.setText(f"{d2_deposit:,}원")  # (참고용) 실제 예수금
         
-        # self.log("자산 현황 업데이트 완료") # 로그 너무 많아서 주석 처리
+        # [B] 운용 설정 자금
+        if hasattr(self, 'lbl_bot_capital_setting'):
+            self.lbl_bot_capital_setting.setText(f"{B_bot_capital:,}원")
+            
+        # [C] 여유 자금
+        if hasattr(self, 'lbl_free_capital'):
+            self.lbl_free_capital.setText(f"{C_free_capital:,}원")
+            
+        # [D, E] 자산 운용 현황 대시보드
+        if hasattr(self, 'dash_current_capital'):
+            # [B] 현재 운용 자산 (Total Managed = Stock + Cash)
+            total_managed = self.asset_manager.total_managed_asset
+            self.dash_current_capital.setText(f"{total_managed:,}원")
+            
+        if hasattr(self, 'dash_invested_amount'):
+            # [D] 자동 매수 금액 (Invested)
+            invested = self.asset_manager.data['invested_amount']
+            self.dash_invested_amount.setText(f"{invested:,}원")
+
+        if hasattr(self, 'dash_available_cash'):
+            # [E] 매수 가능 현금 (Available)
+            self.dash_available_cash.setText(f"{E_available:,}원")
+
+        # [NEW] 메인 자동매매 탭의 운용 자산 표시 갱신
+        if hasattr(self, 'lbl_trading_tab_capital'):
+            # [B] 운용 자산 (Total Managed)
+            self.lbl_trading_tab_capital.setText(f"{total_managed:,}원")
+            
+        # 수익 현황
+        if hasattr(self, 'dash_profit'):
+            self.dash_profit.setText(f"{summary['누적_수익금']:,}원")
+            
+        if hasattr(self, 'dash_profit_rate'):
+            self.dash_profit_rate.setText(f"{summary['수익률']:.2f}%")
+            
+            # 수익률 색상 등락 표시
+            rate = float(summary['수익률'])
+            color = "red" if rate > 0 else "blue" if rate < 0 else "black"
+            self.dash_profit_rate.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {color};")
+            self.dash_profit.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {color};")
 
     # ========== 거래 내역 메서드 ==========
 
@@ -905,7 +1009,7 @@ class MainWindow(QMainWindow):
             
             summary = self.asset_manager.get_summary()
             initial = summary['초기_설정액']
-            current = summary['현재_운용금액'] + summary['가용_현금'] # 전체 자산
+            current = summary['현재_운용금액']  # B (이미 초기자금 + 실현수익이 합산된 총 운용 자산)
             profit = current - initial
             profit_rate = (profit / initial * 100) if initial > 0 else 0
             
@@ -1069,14 +1173,16 @@ class MainWindow(QMainWindow):
         
         # 테이블
         self.table_holdings = QTableWidget()
-        self.table_holdings.setColumnCount(8)
+        self.table_holdings.setColumnCount(10)
         self.table_holdings.setHorizontalHeaderLabels([
-            "종목코드", "종목명", "보유수량", "매입가", "현재가", "평가손익", "수익률(%)", "당일거래량"
+            "종목코드", "종목명", "보유수량", "매입가", "매수금액", "현재가", "평가금액", "평가손익", "수익률(%)", "당일거래량"
         ])
         
         # 테이블 헤더 설정
         header = self.table_holdings.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents) # 종목명 컬럼 내용에 맞게 조절
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents) # 코드 컬럼도
         
         layout.addWidget(self.table_holdings)
         group.setLayout(layout)
@@ -1142,8 +1248,11 @@ class MainWindow(QMainWindow):
                 self.label_connect_status.setStyleSheet("color: green; font-weight: bold;")
                 
                 # 계좌 정보 표시
-                account_list = self.kiwoom.get_login_info("ACCNO")
-                self.label_account.setText(account_list.split(';')[0])
+                account_list_str = self.kiwoom.get_login_info("ACCNO")
+                self.kiwoom.account_list = [acc.strip() for acc in account_list_str.split(';') if acc.strip()]
+                
+                if self.kiwoom.account_list:
+                    self.label_account.setText(self.kiwoom.account_list[0])
                 
                 user_id = self.kiwoom.get_login_info("USER_ID")
                 self.label_user_id.setText(user_id)
@@ -1159,15 +1268,7 @@ class MainWindow(QMainWindow):
                     name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
                     self.add_watch_stock_auto(code, name, s_name, save=False)
                     
-                # [NEW] 저장된 수동 감시 목록 UI 복원
-                self.table_watchlist_manual.setRowCount(0)
-                for code in self.strategy.manual_universe:
-                    name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
-                    self.add_watchlist_row_manual(code, name)
-                    # 실시간 시세 등록
-                    self.kiwoom.set_real_reg(code, "10;12;13;228", "1")
-                    # 목표가 계산
-                    self.strategy.calculate_target_price(code)
+                # [REMOVED] 저장된 수동 감시 목록 UI 복원 삭제
                 
                 self.log(f"📂 사용자 설정 로드 완료: {user_id}")
                 
@@ -1195,7 +1296,7 @@ class MainWindow(QMainWindow):
                 # [FIX] 타이머 순차 시작 (1초 주기로 단축하여 사용자 요청 실시간성 확보)
                 QTimer.singleShot(2000, lambda: self.status_timer.start(1000))
                 QTimer.singleShot(3000, lambda: self.holdings_timer.start(5000)) # [FIX] 1초 -> 5초 (이벤트 드리븐으로 대체)
-                QTimer.singleShot(4000, lambda: self.trading_timer.start(2000))  # [FIX] 1초 -> 2초 (과부하 방지)
+                QTimer.singleShot(4000, lambda: self.trading_timer.start(1000))  # [FIX] 2초 -> 1초 (최적화와 시너지)
                 QTimer.singleShot(5000, lambda: self.verify_timer.start(5000))
                 QTimer.singleShot(6000, lambda: self.cleanup_timer.start(60000))
 
@@ -1294,7 +1395,7 @@ class MainWindow(QMainWindow):
             return
         
         try:
-            self.log("계좌 정보를 조회합니다...")
+            # self.log("계좌 정보를 조회합니다...") # [REMOVED] 로그 과다 방지
             account_no = self.label_account.text()
             
             # 1. 예수금 조회
@@ -1308,7 +1409,7 @@ class MainWindow(QMainWindow):
             
             # UI 업데이트 (삭제됨)
             
-            self.log(f"💰 예수금: {deposit:,}원 / 총 평가금액: {total_eval:,}원")
+            # self.log(f"💰 예수금: {deposit:,}원 / 총 평가금액: {total_eval:,}원")
             
             # AssetManager 업데이트 (계좌 정보와 동기화)
             # 주의: 초기 자산 설정 이후에는 AssetManager가 독자적으로 관리해야 하므로
@@ -1329,6 +1430,9 @@ class MainWindow(QMainWindow):
             # 테이블 초기화
             self.table_holdings.setRowCount(0)
             
+            # [NEW] 봇 매수 종목 리스트 조회
+            bot_stocks = self.db.get_bot_stock_codes()
+            
             for i, item in enumerate(holdings):
                 self.table_holdings.insertRow(i)
                 
@@ -1336,6 +1440,11 @@ class MainWindow(QMainWindow):
                 code = item['종목코드'].strip()
                 if code.startswith('A'): code = code[1:]
                 name = item['종목명'].strip()
+                
+                # [NEW] 봇 매수 종목 표시
+                if code in bot_stocks:
+                    name = f"🤖 {name}"
+                
                 qty = int(item['보유수량'])
                 buy_price = int(item['매입가'])
                 curr_price = int(item['현재가'])
@@ -1345,36 +1454,71 @@ class MainWindow(QMainWindow):
                 # 수동 합산
                 manual_total_eval += (curr_price * qty)
                 
-                # [DEBUG] 개별 종목 정보 로그 (딱 한 번만 상세하게)
-                self.log(f"🔎 [보유확인] {name}({code}): {qty}주 | 매입 {buy_price:,} | 현재 {curr_price:,} | 수익률 {profit_rate:.2f}%")
+                # [DEBUG] 개별 종목 정보 로그 (사용자 요청으로 삭제)
+                # self.log(f"🔎 [보유확인] {name}({code}): {qty}주 | 매입 {buy_price:,} | 현재 {curr_price:,} | 수익률 {profit_rate:.2f}%")
                 
                 # [NEW] 표시 필터 (Jitter 방지): 큰 변화가 없으면 수치 떨림 방지를 위해 유지
                 try:
-                    prev_profit = float(self.table_holdings.item(i, 5).text().replace(',', '')) if self.table_holdings.item(i, 5) else 0
+                    prev_profit = float(self.table_holdings.item(i, 7).text().replace(',', '')) if self.table_holdings.item(i, 7) else 0
                     if abs(eval_profit - prev_profit) < 100 and eval_profit != 0:
                         # 100원 미만의 미세한 변화는 무시 (상한가 정산 jitter 등)
                         eval_profit = int(prev_profit)
-                        profit_rate = float(self.table_holdings.item(i, 6).text().replace('%', ''))
+                        profit_rate = float(self.table_holdings.item(i, 8).text().replace('%', ''))
                 except: pass
 
-                # 테이블에 추가
+                # 테이블 아이템 설정
+                # 0:종목코드, 1:종목명, 2:보유수량, 3:매입가, 4:매수금액, 5:현재가, 6:평가금액, 7:평가손익, 8:수익률, 9:당일거래량
+                
+                # 매수금액 / 평가금액 계산
+                total_buy_amount = buy_price * qty
+                total_eval_amount = curr_price * qty
+                
                 self.table_holdings.setItem(i, 0, QTableWidgetItem(code))
                 self.table_holdings.setItem(i, 1, QTableWidgetItem(name))
-                self.table_holdings.setItem(i, 2, QTableWidgetItem(f"{qty:,}"))
-                self.table_holdings.setItem(i, 3, QTableWidgetItem(f"{buy_price:,}"))
-                self.table_holdings.setItem(i, 4, QTableWidgetItem(f"{curr_price:,}"))
                 
-                # 손익 색상 처리
+                item_qty = QTableWidgetItem(f"{qty:,}")
+                item_qty.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table_holdings.setItem(i, 2, item_qty)
+                
+                item_buy = QTableWidgetItem(f"{buy_price:,}")
+                item_buy.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table_holdings.setItem(i, 3, item_buy)
+                
+                # [NEW] 매수금액
+                item_total_buy = QTableWidgetItem(f"{total_buy_amount:,}")
+                item_total_buy.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table_holdings.setItem(i, 4, item_total_buy)
+                
+                item_curr = QTableWidgetItem(f"{curr_price:,}")
+                item_curr.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if eval_profit > 0: item_curr.setForeground(QColor("red"))
+                elif eval_profit < 0: item_curr.setForeground(QColor("blue"))
+                self.table_holdings.setItem(i, 5, item_curr)
+
+                # [NEW] 평가금액
+                item_total_eval = QTableWidgetItem(f"{total_eval_amount:,}")
+                item_total_eval.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if eval_profit > 0: item_total_eval.setForeground(QColor("red"))
+                elif eval_profit < 0: item_total_eval.setForeground(QColor("blue"))
+                self.table_holdings.setItem(i, 6, item_total_eval)
+                
                 item_profit = QTableWidgetItem(f"{eval_profit:,}")
-                item_profit.setForeground(Qt.red if eval_profit > 0 else Qt.blue if eval_profit < 0 else Qt.black)
-                self.table_holdings.setItem(i, 5, item_profit)
+                item_profit.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if eval_profit > 0: item_profit.setForeground(QColor("red"))
+                elif eval_profit < 0: item_profit.setForeground(QColor("blue"))
+                self.table_holdings.setItem(i, 7, item_profit)
                 
                 item_rate = QTableWidgetItem(f"{profit_rate:.2f}%")
-                item_rate.setForeground(Qt.red if profit_rate > 0 else Qt.blue if profit_rate < 0 else Qt.black)
-                self.table_holdings.setItem(i, 6, item_rate)
-                
-                # [NEW] 거래량 컬럼 (초기값)
-                self.table_holdings.setItem(i, 7, QTableWidgetItem("-"))
+                item_rate.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if profit_rate > 0: item_rate.setForeground(QColor("red"))
+                elif profit_rate < 0: item_rate.setForeground(QColor("blue"))
+                self.table_holdings.setItem(i, 8, item_rate)
+
+                # 당일 거래량 (API에서 안 주면 0 처리)
+                vol = int(item.get('거래량', 0) or 0)
+                item_vol = QTableWidgetItem(f"{vol:,}")
+                item_vol.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table_holdings.setItem(i, 9, item_vol)
             
             # [FIX] AssetManager 상태 동기화
             # API값이 0이면 수동 합산값 사용 (모의투자 등에서 API값이 누락될 경우 대비)
@@ -1382,7 +1526,7 @@ class MainWindow(QMainWindow):
             
             self.asset_manager.update_holdings_value(final_eval_value)
             
-            self.log(f"✅ 보유 종목 조회 완료 ({len(holdings)}개) | 평가액: {final_eval_value:,}원")
+            # self.log(f"✅ 보유 종목 조회 완료 ({len(holdings)}개) | 평가액: {final_eval_value:,}원") # [REMOVED] 로그 과다 방지
             
         except Exception as e:
             self.log(f"❌ 계좌 조회 오류: {str(e)}")
@@ -1593,7 +1737,10 @@ class MainWindow(QMainWindow):
         log_line = f"[{timestamp}] {message}"
         
         # GUI에 표시
-        self.text_log.append(log_line)
+        if hasattr(self, 'text_log'):
+            self.text_log.append(log_line)
+        else:
+            print(log_line) # GUI 준비 안됐으면 콘솔 출력
         
         # 파일에 저장 (이모지 오류 방지)
         if hasattr(self, 'file_logger'):
@@ -1604,35 +1751,10 @@ class MainWindow(QMainWindow):
                 clean_msg = message.encode('ascii', 'ignore').decode('ascii')
                 self.file_logger.info(clean_msg)
 
+
     def create_manual_watchlist_group(self):
-        """수동 관리 종목 UI 생성"""
-        group = QGroupBox("수동 관리 종목 (User Managed)")
-        group.setStyleSheet("QGroupBox { border: 2px solid #555; font-weight: bold; }")
-        layout = QVBoxLayout()
-        
-        # 입력 및 추가 버튼
-        input_layout = QHBoxLayout()
-        self.input_watch_code = QLineEdit()
-        self.input_watch_code.setPlaceholderText("종목코드 입력 (예: 005930)")
-        btn_add_watch = QPushButton("추가")
-        btn_add_watch.clicked.connect(self.add_watch_stock)
-        btn_del_watch = QPushButton("삭제")
-        btn_del_watch.clicked.connect(self.remove_watch_stock)
-        
-        input_layout.addWidget(QLabel("종목코드:"))
-        input_layout.addWidget(self.input_watch_code)
-        input_layout.addWidget(btn_add_watch)
-        input_layout.addWidget(btn_del_watch)
-        layout.addLayout(input_layout)
-        
-        self.table_watchlist_manual = QTableWidget()
-        self.table_watchlist_manual.setColumnCount(8)
-        self.table_watchlist_manual.setHorizontalHeaderLabels(["코드", "종목명", "현재가", "등락률", "거래량", "목표가", "전략", "상태"])
-        self.table_watchlist_manual.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        layout.addWidget(self.table_watchlist_manual)
-        
-        group.setLayout(layout)
-        return group
+        """[REMOVED] 수동 관리 종목 UI 생성"""
+        return QWidget() # 빈 위젯 반환하여 레이아웃 오류 방지
 
     def create_auto_watchlist_group(self):
         """자동 발굴 종목 UI 생성"""
@@ -1707,6 +1829,31 @@ class MainWindow(QMainWindow):
         risk_layout.addRow("", desc_stop)
         risk_layout.addRow("익절율 (%):", self.input_take_profit)
         risk_layout.addRow("", desc_take)
+
+        # [NEW] 거래량 및 시간 필터
+        self.input_min_vol = QLineEdit("100,000")
+        self.input_min_vol.setPlaceholderText("예: 100,000")
+        self.input_min_vol.textChanged.connect(self.format_min_vol_input)
+        desc_vol = QLabel("📊 당일 거래량이 설정값 이상인 종목만 매수 대상으로 고려합니다. (단위: 주)")
+        desc_vol.setStyleSheet("color: #666; font-size: 11px; margin-bottom: 5px;")
+        
+        self.input_confirm_count = QLineEdit("3")
+        self.input_confirm_count.setPlaceholderText("예: 3")
+        desc_confirm = QLabel("⏳ 목표가 돌파 후 몇 분(단위: 봉) 동안 유지되어야 매수할지 설정합니다. (기본: 3)")
+        desc_confirm.setStyleSheet("color: #666; font-size: 11px; margin-bottom: 5px;")
+
+        # [NEW] 체결강도 필터 추가
+        self.input_min_intensity = QLineEdit("100")
+        self.input_min_intensity.setPlaceholderText("예: 100")
+        desc_intensity = QLabel("⚡ 실시간 체결강도가 설정치 이상인 종목만 매수합니다. (100% 미만은 매도세 우위)")
+        desc_intensity.setStyleSheet("color: #666; font-size: 11px; margin-bottom: 5px;")
+        
+        risk_layout.addRow("최소 거래량 (주):", self.input_min_vol)
+        risk_layout.addRow("", desc_vol)
+        risk_layout.addRow("최소 체결강도 (%):", self.input_min_intensity)
+        risk_layout.addRow("", desc_intensity)
+        risk_layout.addRow("분봉 확인 횟수 (회):", self.input_confirm_count)
+        risk_layout.addRow("", desc_confirm)
         
         risk_group.setLayout(risk_layout)
         layout.addWidget(risk_group)
@@ -1716,10 +1863,9 @@ class MainWindow(QMainWindow):
         discovery_layout = QVBoxLayout()
         form_layout = QFormLayout()
         
-        # 자동 스캔 여부
-        self.chk_auto_scan = QCheckBox("실시간 전략 발굴 (스마트 스캔) 활성화")
-        self.chk_auto_scan.setToolTip("활성화 시 60초마다 시장을 분석하여 유리한 종목을 자동 발굴합니다.")
-        self.chk_auto_scan.stateChanged.connect(self.refresh_strategy_info)
+        
+        # [REMOVED] 자동 스캔 여부 체크박스 삭제 (항상 활성화)
+        # self.chk_auto_scan = QCheckBox("실시간 전략 발굴 (스마트 스캔) 활성화")
         
         # 스캔 프로필
         self.combo_scan_profile = QComboBox()
@@ -1732,7 +1878,7 @@ class MainWindow(QMainWindow):
         # [FIX] 프로필 변경 시에는 설명만 업데이트 (저장은 수동)
         self.combo_scan_profile.currentIndexChanged.connect(self.update_scan_profile_desc)
         
-        form_layout.addRow(self.chk_auto_scan)
+        # form_layout.addRow(self.chk_auto_scan)
         form_layout.addRow("발굴 방식(프로필):", self.combo_scan_profile)
         
         # 프로필 상세 설명
@@ -1890,24 +2036,19 @@ class MainWindow(QMainWindow):
                 reply = QMessageBox.question(self, "확인", f"K값({k})이 1.0보다 큽니다. 계속하시겠습니까?", QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.No: return
 
-            # 프로필별 고정 기준값 설정
             profile = self.combo_scan_profile.currentText()
-            if "전고점 돌파" in profile:
-                min_vol, min_price = 500.0, 5.0
-            elif "정배열" in profile:
-                min_vol, min_price = 150.0, 2.0
-            elif "볼린저" in profile:
-                min_vol, min_price = 200.0, 3.0
-            else:  # 사용자 정의
-                min_vol, min_price = 100.0, 1.0
+            # [FIX] 콤마(,) 제거 후 숫자로 변환
+            min_vol_raw = self.input_min_vol.text().replace(',', '').strip()
+            min_vol = float(min_vol_raw) if min_vol_raw else 100000.0
             
             params = {
                 'k': k, 
                 'stop_loss': stop, 
                 'take_profit': take,
                 'min_vol': min_vol,
-                'min_price': min_price,
-                'auto_scan': self.chk_auto_scan.isChecked(),
+                'min_intensity': float(self.input_min_intensity.text().strip() or 100.0),
+                'confirm_count': int(self.input_confirm_count.text().strip() or 3),
+                'auto_scan': True, # [FIX] 항상 True (자동매매 시작 시 같이 시작)
                 'profile': profile
             }
             
@@ -1920,25 +2061,15 @@ class MainWindow(QMainWindow):
             
             # 변경 사항 감지
             profile_changed = old_params.get('profile') != params['profile']
-            scan_toggled = old_params.get('auto_scan') != params['auto_scan']
             
             # 설정 변경 시 대기열 초기화
-            if profile_changed or scan_toggled:
+            if profile_changed:
                 self.verification_queue.clear()
                 self.log("🧹 스캔 설정 변경으로 인해 분석 대기열을 초기화했습니다.")
 
-            # 스캔 ON/OFF 처리
-            if params['auto_scan']:
-                if not self.scan_timer.isActive():
-                    self.log("🚀 스마트 스캔 활성화")
-                    self.start_smart_scan()
-                elif profile_changed:
-                    # 이미 스캔 중이지만 프로필이 변경된 경우
-                    self.log(f"🔄 스캔 프로필 변경: {profile}")
-            else:
-                if self.scan_timer.isActive():
-                    self.log("⏹ 스마트 스캔 중지")
-                    self.stop_smart_scan()
+            # 스캔 ON/OFF 처리 (삭제됨: toggle_trading에서 통합 관리)
+            # if params['auto_scan']:
+            #     pass 
 
             QMessageBox.information(self, "저장 완료", "모든 설정이 성공적으로 저장되었습니다.")
             self.refresh_strategy_info()
@@ -2049,23 +2180,28 @@ class MainWindow(QMainWindow):
         if 'take_profit' in params: self.input_take_profit.setText(str(params['take_profit']))
         
         # 스캔 설정 파라미터 (입력 필드는 삭제됨, 프로필만 복원)
-        if 'auto_scan' in params: 
-            self.chk_auto_scan.setChecked(params['auto_scan'])
-            if params['auto_scan']: self.start_smart_scan()
+        # 스캔 설정 파라미터 (입력 필드는 삭제됨, 프로필만 복원)
+        # if 'auto_scan' in params: 
+        #     self.chk_auto_scan.setChecked(params['auto_scan'])
         
         if 'profile' in params:
             index = self.combo_scan_profile.findText(params['profile'])
             if index >= 0:
                 self.combo_scan_profile.setCurrentIndex(index)
                 self.update_scan_profile_desc(index)
+        
+        # [NEW] 거래량 및 확인 횟수 UI 로드
+        if 'min_vol' in params:
+            val = int(params['min_vol'])
+            self.input_min_vol.setText("{:,}".format(val))
+        if 'min_intensity' in params:
+            self.input_min_intensity.setText(str(params['min_intensity']))
+        if 'confirm_count' in params:
+            self.input_confirm_count.setText(str(params['confirm_count']))
                 
-        # 수동 감시 종목 리스트 복구
-        self.table_watchlist_manual.setRowCount(0)
-        for code in self.strategy.manual_universe:
-            # 종목명 조회 (GetMasterCodeName)
-            name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
-            self.add_watchlist_row_manual(code, name)
-            
+        # [REMOVED] 수동 감시 종목 리스트 복구 로직 삭제
+        # self.table_watchlist_manual.setRowCount(0)
+        
         self.strategy.set_universe(self.strategy.universe) # 목표가 재계산 트리거
 
 
@@ -2083,8 +2219,13 @@ class MainWindow(QMainWindow):
             self.is_trading_active = True
             self.btn_auto_start.setText("자동매매 중지")
             self.lbl_trading_status.setText("가동 중 (Trading On)")
-            self.lbl_trading_status.setStyleSheet("color: blue; font-weight: bold; font-size: 14px;")
             self.log("🚀 자동매매를 시작합니다.")
+            
+            # [NEW] 자동매매 시작 시 스캔도 같이 시작
+            if not self.scan_timer.isActive():
+                self.log("📡 실시간 종목 스캔도 함께 시작합니다.")
+                self.start_smart_scan()
+                
         else:
             # 중지
             self.is_trading_active = False
@@ -2092,6 +2233,10 @@ class MainWindow(QMainWindow):
             self.lbl_trading_status.setText("중지됨 (Stopped)")
             self.lbl_trading_status.setStyleSheet("color: red; font-weight: bold; font-size: 14px;")
             self.log("⏹ 자동매매를 중지합니다.")
+            
+            # [NEW] 스캔도 같이 중지
+            if self.scan_timer.isActive():
+                self.stop_smart_scan()
 
     @pyqtSlot()
     def update_market_status(self):
@@ -2126,40 +2271,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def add_watch_stock(self):
-        """수동 감시 종목 추가"""
-        stock_input = self.input_watch_code.text().strip()
-        if not stock_input:
-            return
-            
-        # 종목명인 경우 코드로 변환
-        code = self.name_to_code.get(stock_input, stock_input)
-            
-        if self.kiwoom is None or self.kiwoom.get_connect_state() != 1:
-            QMessageBox.warning(self, "경고", "로그인이 필요합니다.")
-            return
-
-        self.log(f"🔍 {code} 종목 분석 및 수동 감시 리스트 추가 중...")
-        
-        # 1. 전략 유니버스에 추가 (수동 리스트 중복 체크)
-        if code not in self.strategy.manual_universe:
-            self.strategy.manual_universe.append(code)
-            if code not in self.strategy.universe:
-                self.strategy.universe.append(code)
-            
-            # 저장
-            self.strategy.save_config()
-            
-            # 2. UI 테이블에 추가
-            name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
-            self.add_watchlist_row_manual(code, name)
-            
-            # 목표가 계산 트리거
-            self.strategy.calculate_target_price(code)
-            
-            # [NEW] 실시간 시세 등록 (1초 체크를 위해 필수)
-            self.kiwoom.set_real_reg(code, "10", "1")  # 10=현재가, 1=추가등록
-        
-        self.input_watch_code.clear()
+        """[REMOVED] 수동 감시 종목 추가 기능 삭제됨"""
+        pass
 
     @pyqtSlot()
     def setup_stock_completer(self):
@@ -2187,7 +2300,7 @@ class MainWindow(QMainWindow):
         completer.setCompletionMode(QCompleter.PopupCompletion) # 팝업 모드 명시
         
         # 3. 입력창에 적용
-        self.input_watch_code.setCompleter(completer)
+        # [REMOVED] self.input_watch_code.setCompleter(completer)
         self.input_order_code.setCompleter(completer)
         self.input_stock_code.setCompleter(completer)
         
@@ -2199,7 +2312,7 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event):
         """이벤트 필터: 인풋 클릭 시 자동완성 팝업 강제 출력"""
-        if obj in [self.input_watch_code, self.input_order_code, self.input_stock_code]:
+        if obj in [self.input_order_code, self.input_stock_code]:
             if event.type() == QEvent.FocusIn or event.type() == QEvent.MouseButtonRelease:
                 if hasattr(self, 'stock_completer') and self.stock_completer:
                     # 빈 칸이면 전체 리스트, 아니면 현재 입력값 기반 검색
@@ -2210,42 +2323,13 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def add_watchlist_row_manual(self, code, name):
-        """수동 감시 테이블에 한 줄 추가 (내부용)"""
-        row = self.table_watchlist_manual.rowCount()
-        self.table_watchlist_manual.insertRow(row)
-        self.table_watchlist_manual.setItem(row, 0, QTableWidgetItem(code))
-        self.table_watchlist_manual.setItem(row, 1, QTableWidgetItem(name))
-        self.table_watchlist_manual.setItem(row, 2, QTableWidgetItem("조회중"))
-        self.table_watchlist_manual.setItem(row, 3, QTableWidgetItem("-")) # 등락률
-        self.table_watchlist_manual.setItem(row, 4, QTableWidgetItem("-")) # 거래량
-        
-        # 목표가 표시
-        target = self.strategy.target_prices.get(code, 0)
-        self.table_watchlist_manual.setItem(row, 5, QTableWidgetItem(f"{target:,}"))
-        self.table_watchlist_manual.setItem(row, 6, QTableWidgetItem("Volatility")) # 전략명
-        self.table_watchlist_manual.setItem(row, 7, QTableWidgetItem("감시중"))
+        """[REMOVED] 수동 감시 테이블 행 추가 삭제됨"""
+        pass
 
     @pyqtSlot()
     def remove_watch_stock(self):
-        """수동 선택 종목 삭제"""
-        row = self.table_watchlist_manual.currentRow()
-        if row < 0:
-            return
-            
-        code_item = self.table_watchlist_manual.item(row, 0)
-        if code_item:
-            code = code_item.text()
-            # 1. 수동 리스트에서 제거
-            if code in self.strategy.manual_universe:
-                self.strategy.manual_universe.remove(code)
-            
-            # 2. 전체 유니버스에서 제거
-            self.strategy.remove_stock(code)
-            
-            # UI 및 저장
-            self.table_watchlist_manual.removeRow(row)
-            self.strategy.save_config()
-            self.log(f"🗑 {code} 감시 해제 (수동 감시 리스트 삭제 및 저장)")
+        """[REMOVED] 수동 선택 종목 삭제 기능 삭제됨"""
+        pass
 
     @pyqtSlot(str, dict)
     def on_chejan_event(self, gubun, data):
@@ -2410,26 +2494,38 @@ class MainWindow(QMainWindow):
         try:
             profile = self.combo_scan_profile.currentText()
             type_name = "거래량급증" if trcode == "opt10032" else "가격급발동"
+            # [FIX] 프로필별 1차 필터 기준값 (UI 설명과 일치)
+            min_vol_rate = 100.0
+            min_price_rate = 0.0
             
-            # [FIX] 1차 필터 기준값
-            min_vol_rate = 100.0 # 전일대비 거래량 100% 이상
+            if "전고점 돌파" in profile:
+                min_vol_rate = 500.0
+                min_price_rate = 5.0
+            elif "정배열" in profile:
+                min_vol_rate = 150.0
+                min_price_rate = 2.0
+            elif "볼린저" in profile:
+                min_vol_rate = 200.0
+                min_price_rate = 3.0
             
             passed_count = 0
             for item in results:
                 code = item['code']
                 name = item['name']
+                price_rate = float(item.get('price_rate', 0))
+                volume_rate = float(item.get('volume_rate', 0))
                 
                 # 1. 제외 종목 필터링 (스팩, ETF, ETN, 우선주, 관리종목 등)
                 exclude_keywords = ["스팩", "ETF", "ETN", "리츠", "부동산투자신탁", " (W)", "선물", "인버스", "레버리지"]
                 if any(kw in name for kw in exclude_keywords):
                     continue
                 
-                # 거래량 급증 스캔의 경우 비율 체크
-                if trcode == "opt10032" and item.get('volume_rate', 0) < min_vol_rate:
+                # 2. 프로필별 등락률 및 거래량 필터 (UI 준수)
+                if price_rate < min_price_rate or volume_rate < min_vol_rate:
                     continue
                 
-                # [NEW] 등락률 20% 초과 종목 즉시 제외 (발굴 목록 노출 방지)
-                if item.get('price_rate', 0) > 20.0:
+                # 3. 고점 매수 방지 (20% 초과 종목 제외)
+                if price_rate > 20.0:
                     continue
                 
                 # 2. 이미 감시 중이면 TTL 초기화
@@ -2459,33 +2555,40 @@ class MainWindow(QMainWindow):
         daily_data = self.kiwoom.get_daily_data(code)
         if not daily_data: return
         
-        # [NEW] 거래량 필터 (평균 거래량 및 당일 거래량 검증)
+        # [NEW] 거래량 필터 (설정된 최소 거래량 기준)
         current_vol = daily_data[0].get('거래량', 0)
+        min_vol_limit = self.strategy.params.get('min_vol', 100000)
         
-        # 최근 5일 평균 거래량 계산
+        # 최근 5일 평균 거래량도 체크
         avg_vol_5d = sum(d.get('거래량', 0) for d in daily_data[:5]) / 5 if len(daily_data) >= 5 else 0
         
-        # 조건: 당일 거래량 100,000주 이상 AND 5일 평균 거래량 100,000주 이상 (유동성 확보 상향)
-        if current_vol < 100000 or avg_vol_5d < 100000:
-            self.log(f"📉 [조건미달] {name}({code}) 유동성 부족 (당일: {current_vol:,}, 5일평균: {int(avg_vol_5d):,})")
+        if current_vol < min_vol_limit or avg_vol_5d < (min_vol_limit / 2):
+            self.log(f"📉 [조건미달] {name}({code}) 유동성 부족 (현재: {current_vol:,}, 기준: {min_vol_limit:,})")
             return
 
-        # [NEW] 3분봉 상승세(Uptrend) 필터 추가
-        min_data = self.kiwoom.get_minute_data(code, interval=3)
-        if len(min_data) >= 3:
-            # 최근 3개 캔들의 종가가 연속 상승하거나, 3번째 전보다 현재가 높을 것
-            c1 = min_data[0]['종가'] # 현재(가장최근)
-            c2 = min_data[1]['종가'] # 1봉전
-            c3 = min_data[2]['종가'] # 2봉전
+        # [NEW] 분봉 상승세 필터 (설정된 확인 횟수만큼 검증)
+        confirm_count = int(self.strategy.params.get('confirm_count', 3))
+        # 1분봉 데이터 사용 (사용자 요청: 1분 봉을 N분 확인)
+        min_data = self.kiwoom.get_minute_data(code, interval=1) 
+        
+        if len(min_data) >= confirm_count:
+            # 설정된 횟수만큼 분봉이 추세를 유지하는지 확인
+            # c[0]: 현재, c[1]: 1분전...
+            trend_passed = True
+            for i in range(confirm_count - 1):
+                if min_data[i]['종가'] < min_data[i+1]['종가']:
+                    trend_passed = False
+                    break
             
-            if not (c1 > c3 and c1 >= c2): # 완만한 상승세 이상
-                self.log(f"📉 [추세미달] {name}({code}) 3분봉 상승세 아님 ({c3:,} -> {c2:,} -> {c1:,})")
-                return
+            if not trend_passed:
+                 self.log(f"📉 [추세미달] {name}({code}) {confirm_count}분봉 연속 상승세 아님")
+                 return
         else:
-            self.log(f"⚠️ [데이터부족] {name}({code}) 3분봉 데이터가 부족하여 분석 제외")
+            self.log(f"⚠️ [데이터부족] {name}({code}) 분봉 데이터가 부족하여 분석 제외")
             return
 
         # [NEW] 고점 매수 방지 필터 (20% 이상 급등한 종목은 제외)
+        curr_price = 0
         if len(daily_data) >= 2:
              curr_price = daily_data[0]['종가']
              prev_price = daily_data[1]['종가']
@@ -2494,6 +2597,18 @@ class MainWindow(QMainWindow):
              if rise_rate > 20.0:
                  self.log(f"🚫 [고점경고] {name}({code}) 현재 {rise_rate:.2f}% 급등 중 - 추격매수 방지를 위해 제외")
                  return
+
+        # [NEW] 체결강도 필터 (매수세 확인)
+        min_intensity = self.strategy.params.get('min_intensity', 100.0)
+        # 실시간 체결 정보 조회 (현재 체결강도 포함)
+        price_info = self.kiwoom.get_current_price(code)
+        try:
+            current_intensity = float(price_info.get('체결강도', '0').strip())
+            if current_intensity < min_intensity:
+                self.log(f"📉 [조건미달] {name}({code}) 매수세 약함 (체결강도: {current_intensity:.1f}%, 기준: {min_intensity:.1f}%)")
+                return
+        except Exception as e:
+            self.log(f"⚠️ [분석경고] {name}({code}) 체결강도 확인 불가 ({e})")
         
         # 2. 프로필별 정밀 검증
         passed = False
@@ -2575,102 +2690,100 @@ class MainWindow(QMainWindow):
 
     def run_strategy_cycle(self):
         """자동매매 주기적 실행 (수동/자동 리스트 모두 감시)"""
-        # 1. 대상 종목 리스트 합치기 (중복 제거)
-        manual_rows = self.table_watchlist_manual.rowCount()
-        auto_rows = self.table_watchlist_auto.rowCount()
-        total_rows = manual_rows + auto_rows
+        # 1. 대상 종목 리스트 (자동 발굴 리스트만 사용)
+        total_rows = self.table_watchlist_auto.rowCount()
         
         if total_rows == 0:
             return
 
-        # Polling: 1회당 1종목씩
-        idx = self.polling_index % total_rows
-        self.polling_index += 1
+        # [OPTIMIZE] 1회 실행 시 처리 종목 수 증가 (기존 1개 -> 5개)
+        batch_size = min(5, total_rows)
         
-        if idx < manual_rows:
-            target_table = self.table_watchlist_manual
-            row_idx = idx
-        else:
+        for _ in range(batch_size):
+            idx = self.polling_index % total_rows
+            self.polling_index += 1
+            
             target_table = self.table_watchlist_auto
-            row_idx = idx - manual_rows
+            row_idx = idx
             
-        # 컬럼 구조: 0:코드, 1:명, 2:가, 3:률, 4:량, 5:목표(or전략), 6:전략(or조건), 7:상태
-        price_col = 2
-        rate_col = 3
-        volume_col = 4
-        status_col = 7
-            
-        code_item = target_table.item(row_idx, 0)
-        if not code_item: return
-        code = code_item.text()
-        name_item = target_table.item(row_idx, 1)
-        name = name_item.text() if name_item else "Unknown"
-        
-        try:
-            current_price = 0
-            rate = "0"
-            volume = "0"
-            strength = 0.0
-            
-            # [REFACTOR] 캐시는 TradingManager가 관리
-            cache = self.trading_manager.price_cache.get(code)
-            if cache:
-                current_price = int(cache.get('current_price', 0))
-                rate = str(cache.get('rate', 0.0))
-                volume = str(cache.get('volume', 0))
-                strength = cache.get('strength', 0.0)
-
-            # 캐시가 없으면 아직 실시간 데이터 수신 전이므로 SKIP
-            if current_price == 0:
-                return 
-
-            try: vol_val = int(volume)
-            except: vol_val = 0
+            # 컬럼 구조: 0:코드, 1:명, 2:가, 3:률, 4:량, 5:목표(or전략), 6:전략(or조건), 7:상태
+            price_col = 2
+            rate_col = 3
+            volume_col = 4
+            status_col = 7
                 
-            # [NEW] 실시간 고점 종목 자동 제거 (발굴 목록 관리)
+            code_item = target_table.item(row_idx, 0)
+            if not code_item: continue
+            code = code_item.text()
+            name_item = target_table.item(row_idx, 1)
+            name = name_item.text() if name_item else "Unknown"
+            
             try:
-                rate_val = float(rate)
-                if target_table == self.table_watchlist_auto and rate_val > 25.0:
-                    self.log(f"✂️ [목록정리] {name}({code}) {rate_val}% 도달 - 목표 범위 초과로 감시 종료")
-                    self.strategy.remove_stock(code)
-                    if code in self.auto_stock_hits: del self.auto_stock_hits[code]
-                    target_table.removeRow(row_idx)
-                    return
-            except: pass
+                current_price = 0
+                rate = "0"
+                volume = "0"
+                strength = 0.0
                 
-            # UI 업데이트
-            target_table.setItem(row_idx, price_col, QTableWidgetItem(f"{current_price:,}"))
-            target_table.setItem(row_idx, rate_col, QTableWidgetItem(f"{rate}%"))
-            target_table.setItem(row_idx, volume_col, QTableWidgetItem(f"{vol_val:,}"))
-            
-            # 색상 입히기 (등락률)
-            rate_item = target_table.item(row_idx, rate_col)
-            if rate_item:
-                if float(rate) > 0: rate_item.setForeground(Qt.red)
-                elif float(rate) < 0: rate_item.setForeground(Qt.blue)
-            
-            # 매수 감시 및 실행 (TradingManager 위임)
-            # 수동 목록이거나, 자동 목록인 경우 '감시중' 상태일 때만
-            status_item = target_table.item(row_idx, status_col)
-            current_status = status_item.text() if status_item else ""
-            
-            if "매수완료" not in current_status:
-                result = self.trading_manager.process_buy_strategy(code, current_price, rate, strength, name)
-                
-                if result == "ORDERING":
-                    target_table.setItem(row_idx, status_col, QTableWidgetItem("주문중"))
-                elif result == "REMOVE":
-                     if target_table == self.table_watchlist_auto:
+                # [REFACTOR] 캐시는 TradingManager가 관리
+                cache = self.trading_manager.price_cache.get(code)
+                if cache:
+                    current_price = int(cache.get('current_price', 0))
+                    rate = str(cache.get('rate', 0.0))
+                    volume = str(cache.get('volume', 0))
+                    strength = cache.get('strength', 0.0)
+
+                # 캐시가 없으면 아직 실시간 데이터 수신 전이므로 SKIP
+                if current_price == 0:
+                    continue 
+
+                try: vol_val = int(volume)
+                except: vol_val = 0
+                    
+                # [NEW] 실시간 고점 종목 자동 제거 (발굴 목록 관리)
+                try:
+                    rate_val = float(rate)
+                    if rate_val > 25.0:
+                        self.log(f"✂️ [목록정리] {name}({code}) {rate_val}% 도달 - 목표 범위 초과로 감시 종료")
                         self.strategy.remove_stock(code)
+                        if code in self.auto_stock_hits: del self.auto_stock_hits[code]
                         target_table.removeRow(row_idx)
-            else:
-                # [KPX CHEMICAL DEBUG] 사용자 요청에 따른 목표가 상세 추적
-                if code in self.strategy.target_prices:
-                    target = self.strategy.target_prices[code]
-                    if current_price >= target * 0.98: # 목표가 근처일 때만 로그
-                         self.log(f"🔭 [매수대기] {name}: 현재 {current_price:,} / 목표 {target:,} ({'신호임박' if current_price >= target else '미달'})")
-        except Exception as e:
-            self.log(f"⚠️ 사이클 매수대기 에러 ({code}): {e}")
+                        # 행이 삭제되었으므로 total_rows 업데이트 및 인덱스 조정 필요하지만, 
+                        # 루프 내에서는 continue로 넘어가고 다음 사이클에서 반영됨
+                        total_rows = target_table.rowCount()
+                        if total_rows == 0: break
+                        continue
+                except: pass
+                    
+                # UI 업데이트
+                target_table.setItem(row_idx, price_col, QTableWidgetItem(f"{current_price:,}"))
+                target_table.setItem(row_idx, rate_col, QTableWidgetItem(f"{rate}%"))
+                target_table.setItem(row_idx, volume_col, QTableWidgetItem(f"{vol_val:,}"))
+                
+                # 색상 입히기 (등락률)
+                rate_item = target_table.item(row_idx, rate_col)
+                if rate_item:
+                    try:
+                        if float(rate) > 0: rate_item.setForeground(Qt.red)
+                        elif float(rate) < 0: rate_item.setForeground(Qt.blue)
+                    except: pass
+                
+                # 매수 감시 및 실행 (TradingManager 위임)
+                status_item = target_table.item(row_idx, status_col)
+                current_status = status_item.text() if status_item else ""
+                
+                if "매수완료" not in current_status and "주문중" not in current_status:
+                    result = self.trading_manager.process_buy_strategy(code, current_price, rate, strength, name)
+                    
+                    if result == "ORDERING":
+                        target_table.setItem(row_idx, status_col, QTableWidgetItem("주문중"))
+                    elif result == "REMOVE":
+                         self.strategy.remove_stock(code)
+                         target_table.removeRow(row_idx)
+                         total_rows = target_table.rowCount()
+                         if total_rows == 0: break
+                
+            except Exception as e:
+                self.log(f"⚠️ 사이클 매수대기 에러 ({code}): {e}")
 
         # 2. 보유 종목 순회 (매도 - 손절/익절)
         try:
@@ -2817,11 +2930,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str, str)
     def update_status_slot(self, code, status):
         """TradingManager로부터 상태 업데이트 요청 수신"""
-        # 수동 목록 검색
-        for r in range(self.table_watchlist_manual.rowCount()):
-            if self.table_watchlist_manual.item(r, 0).text() == code:
-                self.table_watchlist_manual.setItem(r, 7, QTableWidgetItem(status))
-                return
+        # [REMOVED] 수동 목록 검색 삭제
         
         # 자동 목록 검색
         for r in range(self.table_watchlist_auto.rowCount()):
