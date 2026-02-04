@@ -317,6 +317,21 @@ class AssetManager:
         self.data['available_cash'] += amount
         self._save_config()
         print(f"✅ 현금 해제: {amount:,}원 (잔여: {self.data['available_cash']:,}원)")
+
+    def release_cash_after_sell(self, amount: int):
+        """
+        매도 성공 후 금액을 가용 현금으로 환원 (즉시 재투자 가능하도록)
+        
+        Args:
+            amount: 매도된 총 금액 (현재가 * 수량)
+        """
+        # 세금/수수료 고려 시 약간의 오차가 있을 수 있지만, 
+        # 가용 현금으로 즉시 돌려서 다음 매수를 가능하게 합니다.
+        self.data['available_cash'] += amount
+        
+        # 현재 운용 금액 및 수익률 재계산
+        self.update_available_cash(self.data['available_cash'])
+        print(f"💰 [자산환원] 매도 수익 {amount:,}원이 가용 현금으로 추가되었습니다.")
     
     # ========== 리셋 ==========
     

@@ -1,10 +1,10 @@
 {
-  "initial_capital": 8000000,
-  "current_capital": 8000000,
-  "available_cash": 8000000,
-  "holdings_value": 0,
-  "total_profit": 0,
-  "profit_rate": 0.0,
-  "max_stock_amount": 0,
-  "last_updated": "2026-02-04 00:24:44"
+  "initial_capital": 7999234,
+  "current_capital": 9859163,
+  "available_cash": 3911443,
+  "holdings_value": 5947720,
+  "total_profit": 1859929,
+  "profit_rate": 23.251338815691604,
+  "max_stock_amount": 2000000,
+  "last_updated": "2026-02-04 15:56:41"
 }

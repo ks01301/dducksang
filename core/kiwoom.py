@@ -3,6 +3,7 @@
 """
 import sys
 import os
+import time  # [NEW] Rate Limiting용
 
 # PyQt5 플러그인 경로 설정 (Qt platform plugin 오류 해결)
 import PyQt5
@@ -20,8 +21,12 @@ class Kiwoom(QObject):
     
     # 조건검색 및 스캔 관련 시그널
     sig_condition_load = pyqtSignal(list)       # 조건식 목록 수신 시
-    sig_condition_result = pyqtSignal(str, list) # 조건검색 결과 수신 시
-    sig_real_condition = pyqtSignal(str, str, str) # 실시간 조건편입/이탈
+    sig_condition_result = pyqtSignal(str, list)   # 조건검색 결과 (화면번호, [종목리스트])
+    sig_real_condition = pyqtSignal(str, str, str) # 실시간 조건검색 (종목코드, 종류, 조건명)
+    
+    # [NEW] 체결/실시간 데이터 시그널
+    sig_chejan_received = pyqtSignal(str, dict)    # 구분(0:주문체결, 1:잔고), 데이터딕셔너리
+    sig_real_data = pyqtSignal(str, dict)          # 종목코드, 실시간데이터(가격, 등락률 등)
     sig_scan_result = pyqtSignal(str, list)      # 스마트 스캔 결과 수신 시 (tr_code, data_list)
 
     def __init__(self):
@@ -35,13 +40,17 @@ class Kiwoom(QObject):
         self.ocx = QAxWidget("KHOPENAPI.KHOpenAPICtrl.1")
         
         # 이벤트 루프 (비동기 데이터 수신 대기용)
-        self.event_loop = None
+        self.loops = {}
         
         # 데이터 저장용 딕셔너리
         self.data = {}
-        
-        # 로그인 상태
+        self.account_holdings = []
+        self.account_summary = {}
         self.login_err_code = None
+        
+        # [NEW] Rate Limiting (요청 제한)
+        self.last_req_time = 0.0
+
         
         # 이벤트 연결
         self._connect_events()
@@ -60,6 +69,11 @@ class Kiwoom(QObject):
         self.ocx.OnReceiveConditionVer.connect(self._on_receive_condition_ver)
         self.ocx.OnReceiveTrCondition.connect(self._on_receive_tr_condition)
         self.ocx.OnReceiveRealCondition.connect(self._on_receive_real_condition)
+        
+        # [NEW] 실시간 데이터 이벤트 연결
+        self.ocx.OnReceiveRealData.connect(self._on_receive_real_data)
+        
+        print("✅ 키움 API 이벤트 연결 완료")
     
     # ========== 이벤트 핸들러 ==========
     
@@ -74,8 +88,8 @@ class Kiwoom(QObject):
             print(f"❌ 로그인 실패: {error_msg} (에러코드: {err_code})")
         
         # 이벤트 루프 종료
-        if self.event_loop:
-            self.event_loop.exit()
+        if 'login' in self.loops:
+            self.loops['login'].exit()
     
     def _on_receive_tr_data(self, screen_no, rqname, trcode, record_name, 
                             prev_next, data_len, err_code, msg1, msg2):
@@ -89,6 +103,7 @@ class Kiwoom(QObject):
             self.data['시가'] = self._get_comm_data(trcode, rqname, 0, "시가")
             self.data['고가'] = self._get_comm_data(trcode, rqname, 0, "고가")
             self.data['저가'] = self._get_comm_data(trcode, rqname, 0, "저가")
+            self.data['체결강도'] = self._get_comm_data(trcode, rqname, 0, "체결강도")
         
         elif rqname == "예수금조회":
             # 예수금 데이터 추출
@@ -97,22 +112,60 @@ class Kiwoom(QObject):
             self.data['유가잔고평가액'] = self._get_comm_data(trcode, rqname, 0, "유가잔고평가액")
             self.data['총평가금액'] = self._get_comm_data(trcode, rqname, 0, "총평가금액")
         
+        elif rqname == "주식분봉차트조회":
+            cnt = self.ocx.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
+            data = []
+            for i in range(cnt):
+                date = self._get_comm_data(trcode, rqname, i, "체결시간")
+                open_price = self._get_comm_data(trcode, rqname, i, "시가")
+                high_price = self._get_comm_data(trcode, rqname, i, "고가")
+                low_price = self._get_comm_data(trcode, rqname, i, "저가")
+                close_price = self._get_comm_data(trcode, rqname, i, "현재가")
+                volume = self._get_comm_data(trcode, rqname, i, "거래량")
+                
+                data.append({
+                    '시간': date.strip(),
+                    '시가': abs(int(open_price)),
+                    '고가': abs(int(high_price)),
+                    '저가': abs(int(low_price)),
+                    '종가': abs(int(close_price)),
+                    '거래량': abs(int(volume))
+                })
+            self.data['분봉'] = data
+        
         elif rqname == "보유종목조회":
+            # [FIX] opw00018 싱글 데이터(계좌 요약) 추출
+            self.data['총매입금액'] = self._get_comm_data(trcode, rqname, 0, "총매입금액")
+            self.data['총평가금액'] = self._get_comm_data(trcode, rqname, 0, "총평가금액")
+            self.data['총평가손익금액'] = self._get_comm_data(trcode, rqname, 0, "총평가손익금액")
+            self.data['총수익률(%)'] = self._get_comm_data(trcode, rqname, 0, "총수익률(%)")
+            self.data['추정예탁자산'] = self._get_comm_data(trcode, rqname, 0, "추정예탁자산")
+
             # 보유 종목 데이터 추출 (여러 종목)
             cnt = self.ocx.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
             holdings = []
             for i in range(cnt):
                 holding = {
-                    '종목코드': self._get_comm_data(trcode, rqname, i, "종목번호"),
-                    '종목명': self._get_comm_data(trcode, rqname, i, "종목명"),
-                    '보유수량': self._get_comm_data(trcode, rqname, i, "보유수량"),
-                    '매입가': self._get_comm_data(trcode, rqname, i, "매입가"),
-                    '현재가': self._get_comm_data(trcode, rqname, i, "현재가"),
-                    '평가손익': self._get_comm_data(trcode, rqname, i, "평가손익"),
-                    '수익률': self._get_comm_data(trcode, rqname, i, "수익률(%)")
+                    '종목코드': self._get_comm_data(trcode, rqname, i, "종목번호").strip(),
+                    '종목명': self._get_comm_data(trcode, rqname, i, "종목명").strip(),
+                    '보유수량': int(self._get_comm_data(trcode, rqname, i, "보유수량") or 0),
+                    '매입가': int(self._get_comm_data(trcode, rqname, i, "매입가") or 0),
+                    '현재가': abs(int(self._get_comm_data(trcode, rqname, i, "현재가") or 0)),
+                    '평가손익': int(self._get_comm_data(trcode, rqname, i, "평가손익") or 0),
+                    '수익률': float(self._get_comm_data(trcode, rqname, i, "수익률(%)") or 0.0)
                 }
                 holdings.append(holding)
             self.data['보유종목'] = holdings
+            # [FIX] 지속성 있는 멤버 변수에도 저장 (MainWindow에서 안정적으로 접근 가능하도록)
+            self.account_holdings = holdings
+            # 계좌 요약 정보도 저장
+            self.account_summary = {
+                '총매입금액': self.data.get('총매입금액'),
+                '총평가금액': self.data.get('총평가금액'),
+                '총평가손익금액': self.data.get('총평가손익금액'),
+                '총수익률(%)': self.data.get('총수익률(%)'),
+                '추정예탁자산': self.data.get('추정예탁자산')
+            }
         
         elif rqname == "주식일봉차트조회":
             # 일봉 데이터 추출 (600일치)
@@ -124,13 +177,15 @@ class Kiwoom(QObject):
                 high_price = self._get_comm_data(trcode, rqname, i, "고가")
                 low_price = self._get_comm_data(trcode, rqname, i, "저가")
                 close_price = self._get_comm_data(trcode, rqname, i, "현재가")
+                volume = self._get_comm_data(trcode, rqname, i, "거래량")
                 
                 data.append({
                     '일자': date.strip(),
                     '시가': abs(int(open_price)),
                     '고가': abs(int(high_price)),
                     '저가': abs(int(low_price)),
-                    '종가': abs(int(close_price))
+                    '종가': abs(int(close_price)),
+                    '거래량': abs(int(volume))
                 })
             self.data['일봉'] = data
         
@@ -140,8 +195,8 @@ class Kiwoom(QObject):
             self._on_receive_opt10019(trcode, rqname)
         
         # 이벤트 루프 종료
-        if self.event_loop:
-            self.event_loop.exit()
+        if rqname in self.loops:
+            self.loops[rqname].exit()
     
     def _on_receive_chejan_data(self, gubun, item_cnt, fid_list):
         """주문 체결 이벤트 처리"""
@@ -154,12 +209,52 @@ class Kiwoom(QObject):
             order_price = self.ocx.dynamicCall("GetChejanData(int)", 901)  # 주문가격
             filled_qty = self.ocx.dynamicCall("GetChejanData(int)", 911)  # 체결수량
             filled_price = self.ocx.dynamicCall("GetChejanData(int)", 910)  # 체결가격
+            order_status = self.ocx.dynamicCall("GetChejanData(int)", 913)  # 주문상태 (접수/체결/확인 등)
             
             print(f"\n📢 주문 체결: {stock_name}({stock_code})")
             print(f"   주문번호: {order_no}")
             print(f"   주문구분: {order_type}")
+            print(f"   주문상태: {order_status}")
             print(f"   체결수량: {filled_qty} / {order_qty}")
             print(f"   체결가격: {filled_price}원")
+            
+            # [NEW] UI 및 전략으로 체결 정보 전송
+            info = {
+                '주문번호': order_no,
+                '종목코드': stock_code,
+                '종목명': stock_name,
+                '주문구분': order_type, # +매수, -매도
+                '주문상태': order_status, # [NEW] 접수/체결 구분용
+                '체결수량': filled_qty,
+                '체결가격': filled_price,
+                '주문수량': order_qty,
+                '주문가격': order_price
+            }
+            self.sig_chejan_received.emit("0", info)
+
+    def _on_receive_real_data(self, code, real_type, real_data):
+        """실시간 데이터 수신 (OnReceiveRealData)"""
+        if real_type == "주식체결":
+            # 현재가 (FID 10)
+            current_price = self.ocx.dynamicCall("GetCommRealData(QString, int)", code, 10)
+            current_price = abs(int(current_price))
+            
+            # 등락율 (FID 12)
+            rate = self.ocx.dynamicCall("GetCommRealData(QString, int)", code, 12)
+            # 누적거래량 (FID 13)
+            volume = self.ocx.dynamicCall("GetCommRealData(QString, int)", code, 13)
+            # 체결강도 (FID 228)
+            strength = self.ocx.dynamicCall("GetCommRealData(QString, int)", code, 228)
+            
+            data = {
+                'current_price': float(current_price),
+                'rate': float(rate) if rate else 0.0,
+                'volume': int(volume) if volume else 0,
+                'strength': float(strength) if strength else 0.0
+            }
+            
+            # 메인 윈도우로 전송
+            self.sig_real_data.emit(code, data)
     
     # ========== API 메서드 ==========
     
@@ -215,11 +310,13 @@ class Kiwoom(QObject):
             
             print("🔐 로그인 창을 띄웁니다...")
             self.login_err_code = None
+            
+            # 로그인 시도
             self.ocx.dynamicCall("CommConnect()")
             
-            # 로그인 완료까지 대기
-            self.event_loop = QEventLoop()
-            self.event_loop.exec_()
+            # 이벤트 루프 생성 및 대기
+            self.loops['login'] = QEventLoop()
+            self.loops['login'].exec_()
             
             # 로그인 성공 시
             if self.login_err_code == 0:
@@ -231,117 +328,113 @@ class Kiwoom(QObject):
                 return False
         
         print(f"\n❌ {retry_count}회 재시도 후에도 로그인에 실패했습니다.")
-        print("💡 해결 방법:")
-        print("   1. 영웅문 HTS를 재시작해보세요")
-        print("   2. 잠시 후 다시 시도해보세요 (서버 과부하일 수 있음)")
-        print("   3. 키움증권 Open API+ 모듈이 정상 설치되어 있는지 확인하세요")
         return False
     
     def get_connect_state(self):
         """접속 상태 확인 (0: 미접속, 1: 접속)"""
         return self.ocx.dynamicCall("GetConnectState()")
     
+    def _wait_rate_limit(self):
+        """API 요청 제한 대기 (초당 3~4회 제한 준수)"""
+        elapsed = time.time() - self.last_req_time
+        if elapsed < 0.25:  # 250ms 미만 경과 시 대기
+            time.sleep(0.25 - elapsed)
+        self.last_req_time = time.time()
+
     def get_login_info(self, tag):
         """로그인 정보 조회"""
         return self.ocx.dynamicCall("GetLoginInfo(QString)", tag)
     
     def get_current_price(self, stock_code):
         """주식 현재가 조회"""
+        self._wait_rate_limit() # [NEW] 과부하 방지
+        self.data.clear() # [FIX] 이전 데이터 잔존 방지
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "종목코드", stock_code)
-        self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)", "현재가조회", "opt10001", 0, "0101")
-        self.event_loop = QEventLoop()
-        self.event_loop.exec_()
+        ret = self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)", "현재가조회", "opt10001", 0, "0101")
+        
+        if ret != 0:
+            return {}
+
+        # 데이터 수신 대기 (네임드 루프 사용)
+        self.loops['현재가조회'] = QEventLoop()
+        self.loops['현재가조회'].exec_()
+        
         return self.data.copy()
+
+    def set_real_reg(self, codes, fid_list="10", opt_type="1"):
+        """
+        실시간 데이터 등록 (SetRealReg)
+        Args:
+            codes: 종목코드 리스트 (또는 세미콜론 구분 문자열)
+            fid_list: 실시간 FID 리스트 (기본: 10=현재가)
+            opt_type: 등록타입 (0:교체, 1:추가)
+        """
+        if isinstance(codes, list):
+            codes = ";".join(codes)
+            
+        # 화면번호는 '1000' 등으로 고정하거나 관리 필요
+        self.ocx.dynamicCall("SetRealReg(QString, QString, QString, QString)", 
+                             "1000", codes, fid_list, opt_type)
+        # print(f"📡 실시간 등록 요청: {codes} (FID: {fid_list})")
     
     def get_account_balance(self, account_no):
         """
         예수금 조회 (opw00001 TR 사용)
-        
-        Args:
-            account_no: 계좌번호
-        
-        Returns:
-            dict: 예수금 정보
         """
         self.data['예수금'] = {}
         
-        # 입력값 설정
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "계좌번호", account_no)
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
         
-        # TR 요청
-        self.ocx.dynamicCall(
+        self._wait_rate_limit() # [NEW] 과부하 방지
+        ret = self.ocx.dynamicCall(
             "CommRqData(QString, QString, int, QString)",
             "예수금조회", "opw00001", 0, "0102"
         )
         
-        # 데이터 수신 대기
-        self.event_loop = QEventLoop()
-        self.event_loop.exec_()
+        if ret != 0:
+            return {}
+
+        self.loops['예수금조회'] = QEventLoop()
+        self.loops['예수금조회'].exec_()
         
         return self.data.copy()
     
     def get_holdings(self, account_no):
         """
         보유 종목 조회 (opw00018 TR 사용)
-        
-        Args:
-            account_no: 계좌번호
-        
-        Returns:
-            list: 보유 종목 리스트
         """
         self.data['보유종목'] = []
         
-        # 입력값 설정
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "계좌번호", account_no)
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "조회구분", "1")
         
-        # TR 요청
-        self.ocx.dynamicCall(
+        ret = self.ocx.dynamicCall(
             "CommRqData(QString, QString, int, QString)",
             "보유종목조회", "opw00018", 0, "0103"
         )
         
-        # 데이터 수신 대기
-        self.event_loop = QEventLoop()
-        self.event_loop.exec_()
+        if ret != 0:
+            return []
+
+        self.loops['보유종목조회'] = QEventLoop()
+        self.loops['보유종목조회'].exec_()
         
         return self.data.get('보유종목', [])
     
     def send_order(self, order_type, stock_code, quantity, price, account_no):
         """
-        매수/매도 주문 (SendOrder 사용)
-        
-        Args:
-            order_type: 주문 유형 (1: 매수, 2: 매도)
-            stock_code: 종목코드
-            quantity: 주문 수량
-            price: 주문 가격 (0: 시장가)
-            account_no: 계좌번호
-        
-        Returns:
-            int: 주문번호 (0: 실패)
+        매수/매도 주문 (SendOrder 직접 호출)
         """
-        # 시장가/지정가 구분
         hoga_type = "03" if price == 0 else "00"
         
-        # SendOrder 호출
-        result = self.ocx.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            "주문",              # sRQName
-            "0104",             # sScreenNo
-            account_no,         # sAccNo
-            order_type,         # nOrderType (1: 신규매수, 2: 신규매도)
-            stock_code,         # sCode
-            quantity,           # nQty
-            price,              # nPrice
-            hoga_type,          # sHogaGb (00: 지정가, 03: 시장가)
-            ""                  # sOrgOrderNo
+        # dynamicCall 대신 직접 메서드 호출하여 8개 인자 제한 회피
+        result = self.ocx.SendOrder(
+            "주문", "0104", account_no, order_type, stock_code, int(quantity), int(price), hoga_type, ""
         )
         
         if result == 0:
@@ -355,39 +448,53 @@ class Kiwoom(QObject):
     def get_daily_data(self, stock_code, date=None):
         """
         일봉 데이터 조회 (opt10081 TR)
-        
-        Args:
-            stock_code: 종목코드
-            date: 기준 일자 (YYYYMMDD) - 생략 시 최근일
-            
-        Returns:
-            list: 일봉 데이터 리스트 (최신순)
         """
-        self.data['일봉'] = []  # 초기화
+        self.data['일봉'] = []
         
-        # SetInputValue
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "종목코드", stock_code)
-        self.ocx.dynamicCall("SetInputValue(QString, QString)", "기준일자", date if date else "")
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "기준일자", date)
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
         
-        # CommRqData
+        self._wait_rate_limit() # [NEW] 과부하 방지
         ret = self.ocx.dynamicCall(
             "CommRqData(QString, QString, int, QString)", 
-            "주식일봉차트조회", 
-            "opt10081", 
-            0, 
-            "0105"
+            "주식일봉차트조회", "opt10081", 0, "0104"
         )
         
         if ret != 0:
-            print(f"❌ 일봉 조회 요청 실패 (코드: {ret})")
+            print(f"❌ TR 요청 실패 (코드: {ret})")
             return []
             
-        # 이벤트 루프 대기
-        self.event_loop = QEventLoop()
-        self.event_loop.exec_()
+        self.loops['주식일봉차트조회'] = QEventLoop()
+        self.loops['주식일봉차트조회'].exec_()
         
         return self.data.get('일봉', [])
+
+    def get_minute_data(self, stock_code, interval=3):
+        """
+        분봉 데이터 조회 (opt10080 TR)
+        interval: 1, 3, 5, 10, 15, 30, 45, 60
+        """
+        self.data['분봉'] = []
+        
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "종목코드", stock_code)
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "틱범위", str(interval))
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
+        
+        self._wait_rate_limit() # [NEW] 과부하 방지
+        ret = self.ocx.dynamicCall(
+            "CommRqData(QString, QString, int, QString)", 
+            "주식분봉차트조회", "opt10080", 0, "0106"
+        )
+        
+        if ret != 0:
+            print(f"❌ TR 요청 실패 (코드: {ret})")
+            return []
+            
+        self.loops['주식분봉차트조회'] = QEventLoop()
+        self.loops['주식분봉차트조회'].exec_()
+        
+        return self.data.get('분봉', [])
 
 
     # ========== 조건검색 메서드 ==========
@@ -478,6 +585,7 @@ class Kiwoom(QObject):
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "종목조건", "0") # 전체
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "가격구분", "0") # 전체가격
         
+        self._wait_rate_limit() # [NEW] 과부하 방지
         ret = self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)", "거래량급증", "opt10032", 0, "1032")
         return ret
 
@@ -495,6 +603,7 @@ class Kiwoom(QObject):
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "종목조건", "0")
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "가격구분", "0")
         
+        self._wait_rate_limit() # [NEW] 과부하 방지
         ret = self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)", "가격급등락", "opt10019", 0, "1019")
         return ret
 

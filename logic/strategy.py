@@ -23,6 +23,7 @@ class Strategy(QObject):
         import json
         import os
         self.config_file = f"strategy_config_{user_id}.json"
+        self.auto_universe = {} # {code: strategy_name}
         
         if os.path.exists(self.config_file):
             try:
@@ -33,22 +34,25 @@ class Strategy(QObject):
                     if 'params' in data:
                         self.params.update(data['params'])
                     else:
-                        # 하위 호환성: 이전 포맷(전체가 params인 경우) 처리
                         self.params.update(data)
                         
                     # 2. 수동 유니버스 로드
                     if 'manual_universe' in data:
                         self.manual_universe = data['manual_universe']
-                        # universe에도 반영 (중복 제거)
                         for code in self.manual_universe:
                             if code not in self.universe:
                                 self.universe.append(code)
+                    
+                    # 3. 자동 유니버스 로드
+                    if 'auto_universe' in data:
+                        self.auto_universe = data['auto_universe']
+                        for code in self.auto_universe:
+                            if code not in self.universe:
+                                self.universe.append(code)
                                 
-                self.log_msg.emit(f"⚙️ 전략 설정 및 수동 감시 리스트 로드 완료: {user_id}")
+                self.log_msg.emit(f"⚙️ 전략 설정 로드 완료: {user_id} (수동 {len(self.manual_universe)} / 자동 {len(self.auto_universe)})")
             except Exception as e:
                 self.log_msg.emit(f"⚠️ 전략 설정 로드 실패: {e}")
-        else:
-            self.log_msg.emit(f"ℹ️ 저장된 전략 설정이 없어 기본값을 사용합니다.")
 
     def save_config(self):
         """전략 설정 저장"""
@@ -59,7 +63,8 @@ class Strategy(QObject):
         try:
             data = {
                 'params': self.params,
-                'manual_universe': self.manual_universe
+                'manual_universe': self.manual_universe,
+                'auto_universe': getattr(self, 'auto_universe', {})
             }
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -230,12 +235,13 @@ class VolatilityBreakoutStrategy(Strategy):
             
         profit_rate = (current_price - buy_price) / buy_price * 100
         
-        stop_loss = float(self.params['stop_loss'])
-        take_profit = float(self.params['take_profit'])
+        # 손절 기준: 입력값이 양수든 음수든 '손실'이므로 음수로 처리
+        stop_loss = -abs(float(self.params['stop_loss']))
+        take_profit = abs(float(self.params['take_profit']))
         
         if profit_rate <= stop_loss:
-            return True, f"손절 (수익률: {profit_rate:.2f}%)"
+            return True, f"손절 (수익률: {profit_rate:.2f}% / 기준: {stop_loss}%)"
         if profit_rate >= take_profit:
-            return True, f"익절 (수익률: {profit_rate:.2f}%)"
+            return True, f"익절 (수익률: {profit_rate:.2f}% / 기준: {take_profit}%)"
             
         return False, None

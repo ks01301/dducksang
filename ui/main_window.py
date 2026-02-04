@@ -11,10 +11,12 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSlot, QTimer, QTime, QEvent
 from PyQt5.QtGui import QFont
 from PyQt5.QtGui import QFont
-from kiwoom import Kiwoom
-from asset_manager import AssetManager
-from database import Database
-from strategy import VolatilityBreakoutStrategy
+from core.kiwoom import Kiwoom
+from core.database import Database
+from logic.asset_manager import AssetManager
+from logic.strategy import Strategy, VolatilityBreakoutStrategy
+from logic.trading_manager import TradingManager
+import sqlite3
 
 VERSION = "1.0.0"
 
@@ -39,30 +41,32 @@ class MainWindow(QMainWindow):
         self.is_trading_active = False
         self.polling_index = 0  # 감시 종목 순차 조회용 인덱스
         
-        # 타이머 설정 (1초마다 상태 체크)
+        # [FIX] 타이머 초기화 (시작은 하지 않음, 로그인 성공 후 순차 시작)
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.update_market_status)
-        self.status_timer.start(1000)
+        
+        self.verify_timer = QTimer(self)
+        self.verify_timer.timeout.connect(self.process_verification_queue)
+        
+        self.cleanup_timer = QTimer(self)
+        self.cleanup_timer.timeout.connect(self.cleanup_auto_watchlist)
+        
+        self.scan_timer = QTimer(self)
+        self.scan_timer.timeout.connect(self.request_smart_scan)
+        
+        self.trading_timer = QTimer(self)
+        self.trading_timer.timeout.connect(self.run_strategy_cycle)
+        
+        self.holdings_timer = QTimer(self)
+        self.holdings_timer.timeout.connect(self.refresh_holdings)
         
         # 종목 코드/명 맵핑 (자동완성용)
         self.stock_dict = {}     # {code: name}
         self.name_to_code = {}  # {name: code}
         
-        # [NEW] 발굴 검증 큐 및 타이머
+        # 발굴 검증 큐 및 자동 발굴 관리
         self.verification_queue = []
-        self.verify_timer = QTimer(self)
-        self.verify_timer.timeout.connect(self.process_verification_queue)
-        self.verify_timer.start(500) # 0.5초마다 하나씩 검증 (API 제한 방지)
-        
-        # [NEW] 자동 발굴 종목 관리 (TTL: 3회 미포착 시 제거)
         self.auto_stock_hits = {} # {code: hit_count}
-        self.cleanup_timer = QTimer(self)
-        self.cleanup_timer.timeout.connect(self.cleanup_auto_watchlist)
-        self.cleanup_timer.start(180000) # 3분마다 청소
-        
-        # [NEW] 스마트 스캔 타이머
-        self.scan_timer = QTimer(self)
-        self.scan_timer.timeout.connect(self.request_smart_scan)
         
         # [NEW] 파일 로깅 초기화
         self.setup_file_logging()
@@ -72,11 +76,6 @@ class MainWindow(QMainWindow):
         
         # [NEW] 초기 전략 정보 반영
         self.refresh_strategy_info()
-        
-        # [NEW] 매매 실행 타이머 (장중 3초마다)
-        self.trading_timer = QTimer(self)
-        self.trading_timer.timeout.connect(self.run_strategy_cycle)
-        self.trading_timer.start(3000)  # 3초마다 매매 로직 실행
     
     def init_ui(self):
         """UI 초기화"""
@@ -607,15 +606,21 @@ class MainWindow(QMainWindow):
             self.log(f"계좌 잔고 조회 중... ({account_no})")
             balance_data = self.kiwoom.get_account_balance(account_no)
             
+            # [DEBUG] 데이터 구조 확인
+            self.log(f"DEBUG_BALANCE: {balance_data}")
+            
             # 데이터 파싱 (빈 문자열 처리 추가)
-            raw_deposit = balance_data.get('예수금', '0').strip().replace(',', '')
-            raw_d2 = balance_data.get('d+2추정예수금', '0').strip().replace(',', '')
+            raw_deposit = str(balance_data.get('예수금', '0')).strip().replace(',', '')
+            raw_d2 = str(balance_data.get('d+2추정예수금', '0')).strip().replace(',', '')
             
             deposit = int(raw_deposit) if raw_deposit else 0
             d2_deposit = int(raw_d2) if raw_d2 else 0
             
             # 멤버 변수에 저장 (계산용)
             self.current_d2_deposit = d2_deposit
+            
+            # [FIX] AssetManager에 실제 가용 자금 업데이트 (매우 중요)
+            self.asset_manager.update_available_cash(d2_deposit)
             
             # UI 업데이트
             self.lbl_total_deposit.setText(f"{deposit:,}원")
@@ -637,11 +642,12 @@ class MainWindow(QMainWindow):
         try:
             amount = int(self.input_capital_change.text().replace(',', ''))
             
-            # [안전장치] 예수금 초과 방지
+            # [안전장치] 예수금 초과 방지 -> 경고만 표시하고 진행
             if hasattr(self, 'current_d2_deposit') and self.current_d2_deposit > 0:
                 if amount > self.current_d2_deposit:
-                    QMessageBox.critical(self, "자금 설정 오류", f"설정 금액({amount:,}원)이 주문 가능 금액({self.current_d2_deposit:,}원)을 초과합니다.")
-                    return
+                    # QMessageBox.critical(self, "자금 설정 오류", f"설정 금액({amount:,}원)이 주문 가능 금액({self.current_d2_deposit:,}원)을 초과합니다.")
+                    self.log(f"⚠️ 경고: 설정한 운용 자금({amount:,}원)이 현재 예수금보다 많습니다. (매수 시 예수금 한도 내에서만 동작함)")
+                    # return # [FIX] 강제 리턴 제거
             else:
                  QMessageBox.warning(self, "경고", "안전한 운용을 위해 먼저 [내 계좌 잔고 조회]를 실행해주세요.")
                  return
@@ -660,12 +666,13 @@ class MainWindow(QMainWindow):
         try:
             amount = int(self.input_capital_change.text().replace(',', ''))
             
-            # [안전장치] 예수금 초과 방지
+            # [안전장치] 예수금 초과 방지 -> 경고만 표시하고 진행
             if hasattr(self, 'current_d2_deposit') and self.current_d2_deposit > 0:
                 current_total = self.asset_manager.get_total_capital()
                 if current_total + amount > self.current_d2_deposit:
-                    QMessageBox.critical(self, "한도 초과", f"운용 자금이 실제 예수금({self.current_d2_deposit:,}원)을 초과할 수 없습니다.")
-                    return
+                    # QMessageBox.critical(self, "한도 초과", f"운용 자금이 실제 예수금({self.current_d2_deposit:,}원)을 초과할 수 없습니다.")
+                    self.log(f"⚠️ 경고: 증액 후 운용 자금이 현재 예수금보다 많습니다.")
+                    # return # [FIX] 강제 리턴 제거
             else:
                  QMessageBox.warning(self, "경고", "안전한 운용을 위해 먼저 [내 계좌 잔고 조회]를 실행해주세요.")
                  return
@@ -782,18 +789,27 @@ class MainWindow(QMainWindow):
     def refresh_asset_status(self):
         """자산 현황 새로고침"""
         # [NEW] 로그인 상태일 때 계좌 잔고 자동 조회
+        real_d2_deposit = 0
         if self.kiwoom and self.kiwoom.get_connect_state() == 1 and hasattr(self, 'lbl_total_deposit'):
             account_no = self.label_account.text()
             if account_no and account_no != "-":
                 try:
                     balance_data = self.kiwoom.get_account_balance(account_no)
                     raw_deposit = balance_data.get('예수금', '0').strip().replace(',', '')
-                    raw_d2 = balance_data.get('d+2추정예수금', '0').strip().replace(',', '')
+                    raw_d2 = str(balance_data.get('d+2추정예수금', '0')).strip().replace(',', '')
                     deposit = int(raw_deposit) if raw_deposit else 0
                     d2_deposit = int(raw_d2) if raw_d2 else 0
+                    real_d2_deposit = d2_deposit
+                    
                     self.current_d2_deposit = d2_deposit
                     self.lbl_total_deposit.setText(f"{deposit:,}원")
                     self.lbl_available_deposit.setText(f"{d2_deposit:,}원")
+                    
+                    # [FIX] AssetManager와 API 데이터 동기화 (오차 보정)
+                    # API가 주는 D+2 예수금이 가장 정확한 '가용 현금'임
+                    if d2_deposit > 0:
+                        self.asset_manager.sync_balance(d2_deposit)
+                        
                 except:
                     pass
         
@@ -816,7 +832,10 @@ class MainWindow(QMainWindow):
         
         self.dash_current_capital.setText(f"{current_capital:,}원")
 
-        self.dash_available_cash.setText(f"{summary['가용_현금']:,}원")
+        # [FIX] 단순 계산값 대신 API 기반 값 우선 표시
+        display_cash = real_d2_deposit if real_d2_deposit > 0 else summary['가용_현금']
+        self.dash_available_cash.setText(f"{display_cash:,}원")
+        
         self.dash_profit.setText(f"{summary['누적_수익금']:,}원")
         
         profit_rate = summary['수익률']
@@ -830,13 +849,13 @@ class MainWindow(QMainWindow):
             self.dash_profit_rate.setStyleSheet("font-size: 18px; font-weight: bold; color: blue;")
             self.dash_profit.setStyleSheet("font-size: 18px; font-weight: bold; color: blue;")
         
-        self.log("자산 현황 업데이트 완료")
+        # self.log("자산 현황 업데이트 완료") # 로그 너무 많아서 주석 처리
 
     # ========== 거래 내역 메서드 ==========
 
     @pyqtSlot()
     def refresh_history(self):
-        """거래 내역 및 리포트 조회"""
+        """거래 내역 및 리포트 조회 (자동 갱신)"""
         try:
             # 1. 일일 요약 조회
             summaries = self.db.get_summary_history()
@@ -872,11 +891,44 @@ class MainWindow(QMainWindow):
                 self.table_trade_log.setItem(i, 4, QTableWidgetItem(f"{item.get('quantity', 0):,}"))
                 self.table_trade_log.setItem(i, 5, QTableWidgetItem(f"{item.get('total_amount', 0):,}"))
                 self.table_trade_log.setItem(i, 6, QTableWidgetItem(item.get('order_number', '-')))
-            
             self.log("거래 내역 조회 완료")
             
         except Exception as e:
-            self.log(f"❌ 내역 조회 실패: {e}")
+            self.log(f"❌ 내역 조회 실패: {str(e)}")
+
+    @pyqtSlot()
+    def update_db_daily_summary(self):
+        """데이터베이스에 일일 요약 정보 자동 업데이트"""
+        try:
+            from datetime import date
+            today = date.today().strftime('%Y-%m-%d')
+            
+            summary = self.asset_manager.get_summary()
+            initial = summary['초기_설정액']
+            current = summary['현재_운용금액'] + summary['가용_현금'] # 전체 자산
+            profit = current - initial
+            profit_rate = (profit / initial * 100) if initial > 0 else 0
+            
+            # 오늘 거래 횟수
+            trade_count = self.db.get_trade_count(start_date=today)
+            
+            self.db.save_daily_summary(
+                target_date=today,
+                initial_capital=initial,
+                final_capital=current,
+                profit=profit,
+                profit_rate=profit_rate,
+                trade_count=trade_count
+            )
+        except Exception as e:
+            self.log(f"⚠️ 일일 요약 DB 업데이트 에러: {e}")
+
+    @pyqtSlot()
+    def handle_trade_event(self):
+        """매매 발생 시 통합 처리 (DB 저장 후 호출)"""
+        self.update_db_daily_summary()
+        self.refresh_history() # UI 즉시 갱신
+        self.refresh_asset_status()
 
     def create_user_info_group(self):
         """사용자 접속 정보 및 로그아웃 영역 생성"""
@@ -1017,9 +1069,9 @@ class MainWindow(QMainWindow):
         
         # 테이블
         self.table_holdings = QTableWidget()
-        self.table_holdings.setColumnCount(7)
+        self.table_holdings.setColumnCount(8)
         self.table_holdings.setHorizontalHeaderLabels([
-            "종목코드", "종목명", "보유수량", "매입가", "현재가", "평가손익", "수익률(%)"
+            "종목코드", "종목명", "보유수량", "매입가", "현재가", "평가손익", "수익률(%)", "당일거래량"
         ])
         
         # 테이블 헤더 설정
@@ -1057,6 +1109,13 @@ class MainWindow(QMainWindow):
                 # 전략에 키움 객체 연결
                 self.strategy.kiwoom = self.kiwoom
                 
+                # [NEW] TradingManager 초기화 (매매 로직 전담)
+                # Kiwoom 객체 생성 직후에 초기화해야 함
+                self.trading_manager = TradingManager(self.kiwoom, self.db, self.asset_manager, self.strategy)
+                self.trading_manager.sig_log.connect(self.log)
+                self.trading_manager.sig_trade_event.connect(self.handle_trade_event)
+                self.trading_manager.sig_update_status.connect(self.update_status_slot)
+                
             # 시그널 연결 (중복 방지를 위해 안전하게 처리)
             try:
                 self.kiwoom.sig_scan_result.disconnect()
@@ -1069,6 +1128,10 @@ class MainWindow(QMainWindow):
             self.kiwoom.sig_condition_load.connect(self.update_condition_combo)
             self.kiwoom.sig_condition_result.connect(self.on_condition_result)
             self.kiwoom.sig_real_condition.connect(self.on_real_condition)
+            
+            # [REFACTOR] 실시간/체결 이벤트는 TradingManager가 처리함 -> MainWindow 연결 해제
+            # self.kiwoom.sig_chejan_received.connect(self.on_chejan_event)
+            # self.kiwoom.sig_real_data.connect(self.on_real_data)
             
             # 로그인
             self.kiwoom.login()
@@ -1089,6 +1152,22 @@ class MainWindow(QMainWindow):
                 user_id_str = user_id.strip()
                 self.asset_manager.load_user_config(user_id_str)
                 self.strategy.load_config(user_id_str)  # 전략 설정 로드
+                
+                # [NEW] 저장된 자동 발굴 목록 UI 복원
+                self.table_watchlist_auto.setRowCount(0)
+                for code, s_name in self.strategy.auto_universe.items():
+                    name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
+                    self.add_watch_stock_auto(code, name, s_name, save=False)
+                    
+                # [NEW] 저장된 수동 감시 목록 UI 복원
+                self.table_watchlist_manual.setRowCount(0)
+                for code in self.strategy.manual_universe:
+                    name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
+                    self.add_watchlist_row_manual(code, name)
+                    # 실시간 시세 등록
+                    self.kiwoom.set_real_reg(code, "10;12;13;228", "1")
+                    # 목표가 계산
+                    self.strategy.calculate_target_price(code)
                 
                 self.log(f"📂 사용자 설정 로드 완료: {user_id}")
                 
@@ -1112,6 +1191,13 @@ class MainWindow(QMainWindow):
                 
                 # [NEW] 종목 전용 자동완성기 설정 (별도 타이머로 약간 뒤에 실행하여 UI 부하 방지)
                 QTimer.singleShot(1000, self.setup_stock_completer)
+                
+                # [FIX] 타이머 순차 시작 (1초 주기로 단축하여 사용자 요청 실시간성 확보)
+                QTimer.singleShot(2000, lambda: self.status_timer.start(1000))
+                QTimer.singleShot(3000, lambda: self.holdings_timer.start(5000)) # [FIX] 1초 -> 5초 (이벤트 드리븐으로 대체)
+                QTimer.singleShot(4000, lambda: self.trading_timer.start(2000))  # [FIX] 1초 -> 2초 (과부하 방지)
+                QTimer.singleShot(5000, lambda: self.verify_timer.start(5000))
+                QTimer.singleShot(6000, lambda: self.cleanup_timer.start(60000))
 
             else:
                 self.log("❌ 로그인 실패")
@@ -1230,8 +1316,15 @@ class MainWindow(QMainWindow):
             # (봇 운용 자금 != 전체 예수금)
             # self.asset_manager.update_available_cash(deposit)  <-- 삭제
             
-            # 2. 보유 종목 조회
+            # 2. 보유 종목 조회 (opw00018)
             holdings = self.kiwoom.get_holdings(account_no)
+            
+            # [FIX] 총 보유 종목 평가금액 계산 (API 값 or 수동 합산)
+            # kiwoom.py에서 opw00018 호출 시 '총평가금액'을 self.kiwoom.data에 저장하도록 수정했음
+            api_total_eval = int(self.kiwoom.data.get('총평가금액', '0') or 0)
+            
+            # 수동 합산 (Cross-check)
+            manual_total_eval = 0
             
             # 테이블 초기화
             self.table_holdings.setRowCount(0)
@@ -1240,7 +1333,8 @@ class MainWindow(QMainWindow):
                 self.table_holdings.insertRow(i)
                 
                 # 데이터 파싱
-                code = item['종목코드'].strip()[1:]  # A005930 -> 005930
+                code = item['종목코드'].strip()
+                if code.startswith('A'): code = code[1:]
                 name = item['종목명'].strip()
                 qty = int(item['보유수량'])
                 buy_price = int(item['매입가'])
@@ -1248,6 +1342,21 @@ class MainWindow(QMainWindow):
                 eval_profit = int(item['평가손익'])
                 profit_rate = float(item['수익률'])
                 
+                # 수동 합산
+                manual_total_eval += (curr_price * qty)
+                
+                # [DEBUG] 개별 종목 정보 로그 (딱 한 번만 상세하게)
+                self.log(f"🔎 [보유확인] {name}({code}): {qty}주 | 매입 {buy_price:,} | 현재 {curr_price:,} | 수익률 {profit_rate:.2f}%")
+                
+                # [NEW] 표시 필터 (Jitter 방지): 큰 변화가 없으면 수치 떨림 방지를 위해 유지
+                try:
+                    prev_profit = float(self.table_holdings.item(i, 5).text().replace(',', '')) if self.table_holdings.item(i, 5) else 0
+                    if abs(eval_profit - prev_profit) < 100 and eval_profit != 0:
+                        # 100원 미만의 미세한 변화는 무시 (상한가 정산 jitter 등)
+                        eval_profit = int(prev_profit)
+                        profit_rate = float(self.table_holdings.item(i, 6).text().replace('%', ''))
+                except: pass
+
                 # 테이블에 추가
                 self.table_holdings.setItem(i, 0, QTableWidgetItem(code))
                 self.table_holdings.setItem(i, 1, QTableWidgetItem(name))
@@ -1257,20 +1366,23 @@ class MainWindow(QMainWindow):
                 
                 # 손익 색상 처리
                 item_profit = QTableWidgetItem(f"{eval_profit:,}")
-                if eval_profit > 0:
-                    item_profit.setForeground(Qt.red)
-                elif eval_profit < 0:
-                    item_profit.setForeground(Qt.blue)
+                item_profit.setForeground(Qt.red if eval_profit > 0 else Qt.blue if eval_profit < 0 else Qt.black)
                 self.table_holdings.setItem(i, 5, item_profit)
                 
                 item_rate = QTableWidgetItem(f"{profit_rate:.2f}%")
-                if profit_rate > 0:
-                    item_rate.setForeground(Qt.red)
-                elif profit_rate < 0:
-                    item_rate.setForeground(Qt.blue)
+                item_rate.setForeground(Qt.red if profit_rate > 0 else Qt.blue if profit_rate < 0 else Qt.black)
                 self.table_holdings.setItem(i, 6, item_rate)
+                
+                # [NEW] 거래량 컬럼 (초기값)
+                self.table_holdings.setItem(i, 7, QTableWidgetItem("-"))
             
-            self.log(f"✅ 보유 종목 조회 완료 ({len(holdings)}개)")
+            # [FIX] AssetManager 상태 동기화
+            # API값이 0이면 수동 합산값 사용 (모의투자 등에서 API값이 누락될 경우 대비)
+            final_eval_value = api_total_eval if api_total_eval > 0 else manual_total_eval
+            
+            self.asset_manager.update_holdings_value(final_eval_value)
+            
+            self.log(f"✅ 보유 종목 조회 완료 ({len(holdings)}개) | 평가액: {final_eval_value:,}원")
             
         except Exception as e:
             self.log(f"❌ 계좌 조회 오류: {str(e)}")
@@ -1329,6 +1441,7 @@ class MainWindow(QMainWindow):
                 # DB에 매매 기록 저장
                 stock_name = self.kiwoom.data.get('종목명', '알수없음')
                 self.db.save_trade(stock_code, stock_name, "매수", order_price, qty)
+                self.handle_trade_event()
                 
                 QMessageBox.information(self, "성공", "매수 주문이 전송되었습니다.")
             else:
@@ -1337,6 +1450,52 @@ class MainWindow(QMainWindow):
                 
         except ValueError:
             QMessageBox.warning(self, "오류", "수량과 가격은 숫자여야 합니다.")
+        except Exception as e:
+            self.log(f"❌ 매수 주문 중 오류: {e}")
+
+    def emergency_sell_stock(self, code):
+        """특정 종목 즉시 전량 매도 및 자산 환원 (긴급 조치용)"""
+        try:
+            account_no = self.label_account.text()
+            # 1. 보유 현황 확인
+            holdings = self.kiwoom.account_holdings
+            target = None
+            for item in holdings:
+                raw_code = item['종목코드'].strip()
+                if raw_code.endswith(code):
+                    target = item
+                    break
+            
+            if not target:
+                self.log(f"⚠️ [긴급매도] {code} 종목을 보유하고 있지 않습니다.")
+                return
+
+            qty = int(target['보유수량'])
+            name = target['종목명']
+            current_price = abs(int(target['현재가']))
+            
+            if qty <= 0:
+                self.log(f"⚠️ [긴급매도] {name}({code}) 보유 수량이 0입니다.")
+                return
+
+            self.log(f"🚨 [긴급매도 실행] {name}({code}) {qty}주 시장가 매도 주문")
+            
+            # 2. 주문 실행
+            ret = self.kiwoom.send_order(2, code, qty, 0, account_no)
+            if ret == 0:
+                # 3. 자산 즉시 환원
+                self.asset_manager.release_cash_after_sell(current_price * qty)
+                # 4. 기록 저장
+                self.db.save_trade(code, name, "매도(긴급)", current_price, qty)
+                self.handle_trade_event()
+                self.log(f"✅ [긴급매도성공] {name} 매도 주문 전송 및 자산 {current_price*qty:,}원 환원 완료")
+                
+                # 보유 리스트에서 즉시 제거 (데이터 일관성)
+                target['보유수량'] = 0
+            else:
+                self.log(f"❌ [긴급매도실패] {name} 주문 실패 (코드: {ret})")
+        except Exception as e:
+            self.log(f"❌ 긴급매도 에러: {e}")
 
     @pyqtSlot()
     def sell_stock(self):
@@ -1640,7 +1799,7 @@ class MainWindow(QMainWindow):
         
         if "전고점 돌파" in profile:
             desc = (
-                "� **[전고점 돌파 포착 전략]**\n\n"
+                " **[전고점 돌파 포착 전략]**\n\n"
                 "**📊 자동 검증 기준:**\n"
                 "1️⃣ 거래량 500% 이상 급증 (1차 스크리닝)\n"
                 "2️⃣ 최근 20일 최고가를 오늘 돌파 확인 (차트 분석)\n"
@@ -1652,7 +1811,7 @@ class MainWindow(QMainWindow):
             )
         elif "정배열" in profile:
             desc = (
-                "� **[정배열 & 골든크로스 전략]**\n\n"
+                " **[정배열 & 골든크로스 전략]**\n\n"
                 "**📊 자동 검증 기준:**\n"
                 "1️⃣ 거래량 150% 이상 증가 (1차 스크리닝)\n"
                 "2️⃣ 5일선 > 20일선 > 60일선 정배열 확인 (차트 분석)\n"
@@ -1665,7 +1824,7 @@ class MainWindow(QMainWindow):
             )
         elif "볼린저" in profile:
             desc = (
-                "� **[볼린저 밴드 돌파 전략]**\n\n"
+                " **[볼린저 밴드 돌파 전략]**\n\n"
                 "**📊 자동 검증 기준:**\n"
                 "1️⃣ 거래량 200% 이상 급증 (1차 스크리닝)\n"
                 "2️⃣ 볼린저 밴드 상단선 상향 돌파 확인 (차트 분석)\n"
@@ -1996,6 +2155,9 @@ class MainWindow(QMainWindow):
             
             # 목표가 계산 트리거
             self.strategy.calculate_target_price(code)
+            
+            # [NEW] 실시간 시세 등록 (1초 체크를 위해 필수)
+            self.kiwoom.set_real_reg(code, "10", "1")  # 10=현재가, 1=추가등록
         
         self.input_watch_code.clear()
 
@@ -2084,6 +2246,24 @@ class MainWindow(QMainWindow):
             self.table_watchlist_manual.removeRow(row)
             self.strategy.save_config()
             self.log(f"🗑 {code} 감시 해제 (수동 감시 리스트 삭제 및 저장)")
+
+    @pyqtSlot(str, dict)
+    def on_chejan_event(self, gubun, data):
+        """체결/잔고 데이터 수신"""
+        # [REFACTOR] TradingManager가 전담함.
+        # MainWindow는 Manager의 Signal(sig_update_status, sig_trade_event)을 받아 처리함.
+        pass
+
+
+    @pyqtSlot(str, dict)
+    def on_real_data(self, code, data):
+        """실시간 시세 수신"""
+        # [REFACTOR] 로직은 TradingManager로 이동됨.
+        # 여기서는 오직 UI 상의 '현재가' 표시 업데이트가 필요하다면 사용하지만,
+        # 현재 구조는 타이머(run_strategy_cycle)에서 테이블을 일괄 갱신하므로 
+        # 실시간 이벤트에서 별도 작업 없음.
+        pass
+
 
     # ========== 조건검색 관련 메서드 (NEW) ==========
 
@@ -2184,6 +2364,16 @@ class MainWindow(QMainWindow):
         self.log(f"🔎 [HTS포착] {len(codes)}개 종목 분석 대기열 추가")
         profile = self.combo_scan_profile.currentText()
         for code in codes:
+            # [NEW] 등락률 즉시 확인 (고점 진입 방산)
+            price_data = self.kiwoom.get_current_price(code)
+            try:
+                rate = float(price_data.get('등락율', '0').strip())
+            except: rate = 0
+            
+            if rate > 20.0:
+                self.log(f"🚫 [HTS제외] {code} 등락률 {rate}% 초과로 제외")
+                continue
+
             if code not in self.strategy.universe and code not in [c[0] for c in self.verification_queue]:
                 name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
                 self.verification_queue.append((code, name, f"HTS 조건({profile})"))
@@ -2192,6 +2382,16 @@ class MainWindow(QMainWindow):
     def on_real_condition(self, code, type_str, index):
         """실시간 HTS 조건 편입/이탈 처리"""
         if type_str == "I": # 편입
+            # [NEW] 등락률 즉시 확인 (고점 진입 방지)
+            price_data = self.kiwoom.get_current_price(code)
+            try:
+                rate = float(price_data.get('등락율', '0').strip())
+            except: rate = 0
+            
+            if rate > 20.0:
+                self.log(f"🚫 [실시간HTS제외] {code} 등락률 {rate}% 초과로 제외")
+                return
+
             if code not in self.strategy.universe and code not in [c[0] for c in self.verification_queue]:
                 name = self.kiwoom.ocx.dynamicCall("GetMasterCodeName(QString)", code)
                 self.log(f"⚡ [HTS편입] {name}({code}) 검증 시작")
@@ -2211,34 +2411,39 @@ class MainWindow(QMainWindow):
             profile = self.combo_scan_profile.currentText()
             type_name = "거래량급증" if trcode == "opt10032" else "가격급발동"
             
-            # [FIX] 1차 필터: 프로필별 고정 기준값 사용
-            if "전고점 돌파" in profile:
-                min_vol, min_price = 500.0, 5.0
-            elif "정배열" in profile:
-                min_vol, min_price = 150.0, 2.0
-            elif "볼린저" in profile:
-                min_vol, min_price = 200.0, 3.0
-            else:  # 사용자 정의
-                min_vol, min_price = 100.0, 1.0
+            # [FIX] 1차 필터 기준값
+            min_vol_rate = 100.0 # 전일대비 거래량 100% 이상
             
             passed_count = 0
             for item in results:
                 code = item['code']
-                # 기초 필터링 (거래량/가격 기초 조건)
-                if trcode == "opt10032" and item['volume_rate'] < min_vol: continue
+                name = item['name']
                 
-                # 이미 감시 중이면 카운트 초기화 (TTL 연장)
+                # 1. 제외 종목 필터링 (스팩, ETF, ETN, 우선주, 관리종목 등)
+                exclude_keywords = ["스팩", "ETF", "ETN", "리츠", "부동산투자신탁", " (W)", "선물", "인버스", "레버리지"]
+                if any(kw in name for kw in exclude_keywords):
+                    continue
+                
+                # 거래량 급증 스캔의 경우 비율 체크
+                if trcode == "opt10032" and item.get('volume_rate', 0) < min_vol_rate:
+                    continue
+                
+                # [NEW] 등락률 20% 초과 종목 즉시 제외 (발굴 목록 노출 방지)
+                if item.get('price_rate', 0) > 20.0:
+                    continue
+                
+                # 2. 이미 감시 중이면 TTL 초기화
                 if code in self.auto_stock_hits:
                     self.auto_stock_hits[code] = 0
                     continue
                     
-                # 신규 후보라면 검증 큐에 추가
+                # 3. 신규 후보 검증 큐 추가
                 if code not in self.strategy.universe and code not in [c[0] for c in self.verification_queue]:
-                    self.verification_queue.append((code, item['name'], profile))
+                    self.verification_queue.append((code, name, profile))
                     passed_count += 1
             
             if passed_count > 0:
-                self.log(f"📥 [{type_name}] {len(results)}개 수신 -> {passed_count}개 검증 대기열 추가 (기준: {min_vol}%)")
+                self.log(f"📥 [{type_name}] {len(results)}개 수신 -> {passed_count}개 선별 (필터링 완료)")
         except Exception as e:
             self.log(f"❌ [스캔오류] {e}")
 
@@ -2253,6 +2458,42 @@ class MainWindow(QMainWindow):
         # 1. 일봉 데이터 조회 (QEventLoop로 동기적 대기)
         daily_data = self.kiwoom.get_daily_data(code)
         if not daily_data: return
+        
+        # [NEW] 거래량 필터 (평균 거래량 및 당일 거래량 검증)
+        current_vol = daily_data[0].get('거래량', 0)
+        
+        # 최근 5일 평균 거래량 계산
+        avg_vol_5d = sum(d.get('거래량', 0) for d in daily_data[:5]) / 5 if len(daily_data) >= 5 else 0
+        
+        # 조건: 당일 거래량 100,000주 이상 AND 5일 평균 거래량 100,000주 이상 (유동성 확보 상향)
+        if current_vol < 100000 or avg_vol_5d < 100000:
+            self.log(f"📉 [조건미달] {name}({code}) 유동성 부족 (당일: {current_vol:,}, 5일평균: {int(avg_vol_5d):,})")
+            return
+
+        # [NEW] 3분봉 상승세(Uptrend) 필터 추가
+        min_data = self.kiwoom.get_minute_data(code, interval=3)
+        if len(min_data) >= 3:
+            # 최근 3개 캔들의 종가가 연속 상승하거나, 3번째 전보다 현재가 높을 것
+            c1 = min_data[0]['종가'] # 현재(가장최근)
+            c2 = min_data[1]['종가'] # 1봉전
+            c3 = min_data[2]['종가'] # 2봉전
+            
+            if not (c1 > c3 and c1 >= c2): # 완만한 상승세 이상
+                self.log(f"📉 [추세미달] {name}({code}) 3분봉 상승세 아님 ({c3:,} -> {c2:,} -> {c1:,})")
+                return
+        else:
+            self.log(f"⚠️ [데이터부족] {name}({code}) 3분봉 데이터가 부족하여 분석 제외")
+            return
+
+        # [NEW] 고점 매수 방지 필터 (20% 이상 급등한 종목은 제외)
+        if len(daily_data) >= 2:
+             curr_price = daily_data[0]['종가']
+             prev_price = daily_data[1]['종가']
+             rise_rate = (curr_price - prev_price) / prev_price * 100
+             
+             if rise_rate > 20.0:
+                 self.log(f"🚫 [고점경고] {name}({code}) 현재 {rise_rate:.2f}% 급등 중 - 추격매수 방지를 위해 제외")
+                 return
         
         # 2. 프로필별 정밀 검증
         passed = False
@@ -2274,18 +2515,52 @@ class MainWindow(QMainWindow):
             self.log(f"✨ [전략일치] {name}({code}) 포착! 자동 감시를 시작합니다.")
             self.add_watch_stock_auto(code, name, profile)
         else:
-            # self.log(f"❌ [조건미달] {name}({code})")
+            # self.log(f"❌ [조건미달] {name}({code}")
             pass
 
-    def add_watch_stock_auto(self, code, name, strategy_name):
+    def add_watch_stock_auto(self, code, name, strategy_name, save=True):
         """자동 발굴 종목 편입 로직 (Dedicated Table)"""
-        if code in self.strategy.universe:
+        # [NEW] auto_universe 동기화
+        if not hasattr(self.strategy, 'auto_universe'):
+            self.strategy.auto_universe = {}
+            
+        if code in self.strategy.universe and code not in self.strategy.auto_universe:
+            # 이미 수동 감시 중이면 추가 안 함
             return
         
         # 전략에 추가
-        self.strategy.add_stock(code)
+        if code not in self.strategy.universe:
+            self.strategy.add_stock(code)
+            
+        self.strategy.auto_universe[code] = strategy_name
         self.auto_stock_hits[code] = 0 # TTL 초기화
         
+        # [NEW] 실시간 시세 등록 (필수)
+        if self.kiwoom.get_connect_state() == 1:
+            self.kiwoom.set_real_reg(code, "10;12;13;228", "1") # 추가등록
+            
+            # [FIX] 등록 직후 현재가 한 번 조회하여 캐시 초기화 (UI 조회중 방지)
+            # set_real_reg는 변동 시에만 데이터를 주므로, 초기값이 없으면 계속 '조회중'으로 남음
+            initial_data = self.kiwoom.get_current_price(code)
+            if initial_data:
+                # API 데이터 포맷 통일 (on_real_data와 맞춤)
+                real_data_fmt = {
+                    'current_price': float(abs(int(initial_data.get('현재가', 0)))),
+                    'rate': float(initial_data.get('등락율', 0.0)),
+                    'volume': int(initial_data.get('거래량', 0)),
+                    'strength': 0.0 # 초기값은 0
+                }
+                # 캐시 즉시 업데이트
+                if not hasattr(self, 'price_cache'): self.price_cache = {}
+                self.price_cache[code] = real_data_fmt
+        if save:
+            self.strategy.save_config()
+        
+        # UI 테이블(AUTO) 중복 체크
+        for r in range(self.table_watchlist_auto.rowCount()):
+            if self.table_watchlist_auto.item(r, 0).text() == code:
+                return
+
         # UI 테이블(AUTO)에 추가
         row = self.table_watchlist_auto.rowCount()
         self.table_watchlist_auto.insertRow(row)
@@ -2328,20 +2603,41 @@ class MainWindow(QMainWindow):
         code_item = target_table.item(row_idx, 0)
         if not code_item: return
         code = code_item.text()
+        name_item = target_table.item(row_idx, 1)
+        name = name_item.text() if name_item else "Unknown"
         
         try:
-            # 현재가 조회
-            data = self.kiwoom.get_current_price(code)
-            current_price = abs(int(data.get('현재가', '0').replace('+', '').replace('-', '') or 0))
-            if current_price == 0: return
+            current_price = 0
+            rate = "0"
+            volume = "0"
+            strength = 0.0
+            
+            # [REFACTOR] 캐시는 TradingManager가 관리
+            cache = self.trading_manager.price_cache.get(code)
+            if cache:
+                current_price = int(cache.get('current_price', 0))
+                rate = str(cache.get('rate', 0.0))
+                volume = str(cache.get('volume', 0))
+                strength = cache.get('strength', 0.0)
 
-            # 등락률 및 거래량
-            rate = data.get('등락율', '0')
-            volume = data.get('거래량', '0')
-            try:
-                vol_val = int(volume)
+            # 캐시가 없으면 아직 실시간 데이터 수신 전이므로 SKIP
+            if current_price == 0:
+                return 
+
+            try: vol_val = int(volume)
             except: vol_val = 0
-
+                
+            # [NEW] 실시간 고점 종목 자동 제거 (발굴 목록 관리)
+            try:
+                rate_val = float(rate)
+                if target_table == self.table_watchlist_auto and rate_val > 25.0:
+                    self.log(f"✂️ [목록정리] {name}({code}) {rate_val}% 도달 - 목표 범위 초과로 감시 종료")
+                    self.strategy.remove_stock(code)
+                    if code in self.auto_stock_hits: del self.auto_stock_hits[code]
+                    target_table.removeRow(row_idx)
+                    return
+            except: pass
+                
             # UI 업데이트
             target_table.setItem(row_idx, price_col, QTableWidgetItem(f"{current_price:,}"))
             target_table.setItem(row_idx, rate_col, QTableWidgetItem(f"{rate}%"))
@@ -2353,50 +2649,127 @@ class MainWindow(QMainWindow):
                 if float(rate) > 0: rate_item.setForeground(Qt.red)
                 elif float(rate) < 0: rate_item.setForeground(Qt.blue)
             
-            # 매수 신호 확인
+            # 매수 감시 및 실행 (TradingManager 위임)
+            # 수동 목록이거나, 자동 목록인 경우 '감시중' 상태일 때만
             status_item = target_table.item(row_idx, status_col)
             current_status = status_item.text() if status_item else ""
             
-            if self.strategy.check_buy_signal(code, current_price):
-                if "매수완료" not in current_status:
-                    self.log(f"⚡ [매수신호] {code} - 현재가 {current_price:,}")
-                    account = self.label_account.text()
-                    qty = self.calculate_order_qty(current_price)
-                    ret = self.kiwoom.send_order(1, code, qty, 0, account)
-                    if ret == 0:
-                        target_table.setItem(row_idx, status_col, QTableWidgetItem("매수완료"))
-                        self.asset_manager.reserve_cash(current_price * qty)
+            if "매수완료" not in current_status:
+                result = self.trading_manager.process_buy_strategy(code, current_price, rate, strength, name)
+                
+                if result == "ORDERING":
+                    target_table.setItem(row_idx, status_col, QTableWidgetItem("주문중"))
+                elif result == "REMOVE":
+                     if target_table == self.table_watchlist_auto:
+                        self.strategy.remove_stock(code)
+                        target_table.removeRow(row_idx)
+            else:
+                # [KPX CHEMICAL DEBUG] 사용자 요청에 따른 목표가 상세 추적
+                if code in self.strategy.target_prices:
+                    target = self.strategy.target_prices[code]
+                    if current_price >= target * 0.98: # 목표가 근처일 때만 로그
+                         self.log(f"🔭 [매수대기] {name}: 현재 {current_price:,} / 목표 {target:,} ({'신호임박' if current_price >= target else '미달'})")
         except Exception as e:
             self.log(f"⚠️ 사이클 매수대기 에러 ({code}): {e}")
 
         # 2. 보유 종목 순회 (매도 - 손절/익절)
         try:
-            holdings = self.kiwoom.data.get('보유종목', [])
+            holdings = self.kiwoom.account_holdings # [FIX] 데이터 유실 방지를 위해 지속성 있는 변수 사용
+            if not holdings:
+                # self.log("ℹ️ 감시 중인 보유 종목이 없습니다.") # 로그 너무 많아지므로 생략 가능
+                pass
+            
             for item in holdings:
                 raw_code = item['종목코드']
                 code = raw_code.strip()
                 if len(code) > 6: code = code[-6:]
                 
+                # [FIX] 보유 종목은 refresh_holdings(10초 주기)에서 가져온 가격 사용 (API 과부하 -200 방지)
                 current_price = abs(int(item['현재가']))
+
                 buy_price = int(item['매입가'])
                 qty = int(item['보유수량'])
                 
                 if qty <= 0: continue
+                    
+                # [NEW] 실시간 UI 업데이트 (보유종목 테이블)
+                # 테이블에서 해당 종목 행 찾기
+                for r in range(self.table_holdings.rowCount()):
+                    t_code = self.table_holdings.item(r, 0).text()
+                    if t_code == code:
+                        # 현재가 갱신
+                        self.table_holdings.setItem(r, 4, QTableWidgetItem(f"{current_price:,}"))
+                        
+                        # 평가손익/수익률 재계산
+                        total_buy = buy_price * qty
+                        total_curr = current_price * qty
+                        eval_profit = total_curr - total_buy
+                        profit_rate = (eval_profit / total_buy) * 100 if total_buy > 0 else 0
+                        
+                        # 손익 색상 업데이트
+                        item_profit = QTableWidgetItem(f"{eval_profit:,}")
+                        item_profit.setForeground(Qt.red if eval_profit > 0 else Qt.blue if eval_profit < 0 else Qt.black)
+                        self.table_holdings.setItem(r, 5, item_profit)
+                        
+                        item_rate = QTableWidgetItem(f"{profit_rate:.2f}%")
+                        item_rate.setForeground(Qt.red if profit_rate > 0 else Qt.blue if profit_rate < 0 else Qt.black)
+                        self.table_holdings.setItem(r, 6, item_rate)
+                        break
                 
                 should_sell, msg = self.strategy.check_sell_signal(code, current_price, buy_price)
+                
+                # [BITCOMPUTER DEBUG] 사용자 요청에 따른 비트컴퓨터 집중 추적
+                if code == "032850":
+                    profit_rate = (current_price - buy_price) / buy_price * 100
+                    stop_loss = -abs(float(self.strategy.params['stop_loss']))
+                    self.log(f"🕵️ [비트감시] 현재 {current_price:,}원 (수익률: {profit_rate:.2f}% / 손절기준: {stop_loss}%) - 결과: {'매도신호' if should_sell else '유지'}")
+                
+                if should_sell:
+                    self.log(f"🔔 [매도신호] {item['종목명']}: {msg}") # 선행 로그 추가
+                else:
+                    # [DEBUG] 손절 감시 상황 로깅 (사용자가 궁금해하므로)
+                    check_profit_rate = (current_price - buy_price) / buy_price * 100
+                    if check_profit_rate < -1.0: # -1% 이상 손실 중일 때만 로그
+                         self.log(f"👀 [손절감시] {item['종목명']}: 현재 {check_profit_rate:.2f}% (목표: {self.strategy.params['stop_loss']}%)")
+                
                 if should_sell:
                     account = self.label_account.text()
                     self.log(f"📉 매도 신호 발생: {item['종목명']}({code}) - {msg}")
-                    self.kiwoom.send_order(2, code, qty, 0, account)
+                    ret = self.kiwoom.send_order(2, code, qty, 0, account)
+                    if ret == 0:
+                        self.log(f"✅ [주문성공] {item['종목명']} 매도 주문이 접수되었습니다.")
+                        # 매도 주문 성공 시 보유 수량 즉시 0으로 처리하여 중복 매도 방지
+                        item['보유수량'] = 0
+                        # [FIX] 매도 기록 저장 및 UI 즉시 갱신
+                        self.db.save_trade(code, item['종목명'], "매도", current_price, qty)
+                        self.handle_trade_event()
+                        
+                        # [NEW] 즉시 현금 환원 (재투자 가능하도록)
+                        self.asset_manager.release_cash_after_sell(current_price * qty)
+                    else:
+                        self.log(f"❌ [주문실패] {item['종목명']} 매도 주문 실패 (에러코드: {ret})")
         except Exception as e:
+            self.log(f"⚠️ 보유 종목 순회 에러: {e}")
             pass
 
     def calculate_order_qty(self, price):
-        """주문 수량 계산"""
-        max_amount = self.asset_manager.get_max_stock_amount()
-        if max_amount <= 0: return 1
-        qty = max_amount // price
-        return qty if qty > 0 else 1
+        """주문 수량 계산 (가용 자산 반영)"""
+        max_stock_amount = self.asset_manager.get_max_stock_amount()
+        available_cash = self.asset_manager.get_available_cash()
+        
+        # 1. 종목당 한도 적용 (0이면 무제한이므로 가용현금 전체)
+        target_amount = max_stock_amount if max_stock_amount > 0 else available_cash
+        
+        # 2. 가용 현금보다 많으면 가용 현금으로 제한
+        if target_amount > available_cash:
+            target_amount = available_cash
+            
+        if target_amount <= 0: return 0
+        
+        qty = target_amount // price
+        # [DEBUG] 주문 수량 계산 상세 로그
+        self.log(f"🔢 수량계산: 가격 {price:,} / 한도 {max_stock_amount:,} / 가용 {available_cash:,} -> 목표 {target_amount:,} -> 수량 {int(qty)}")
+        return int(qty)
 
     def cleanup_auto_watchlist(self):
         """자동 발굴된 종목 중 더 이상 조건에 안 맞는 종목 제거"""
@@ -2409,11 +2782,12 @@ class MainWindow(QMainWindow):
         # 역순으로 순회하며 제거
         for i in range(self.table_watchlist_auto.rowCount() - 1, -1, -1):
             code = self.table_watchlist_auto.item(i, 0).text()
-            status = self.table_watchlist_auto.item(i, 5).text()
+            status = self.table_watchlist_auto.item(i, 7).text() # [FIX] column 7이 상태
             
             # 1. 보유 중인 종목인 경우 자동 발굴 리스트에서 제거 (보유종목 테이블에서 관리하도록 유도)
             if code in holding_codes:
                 self.strategy.remove_stock(code)
+                if code in self.strategy.auto_universe: del self.strategy.auto_universe[code]
                 self.table_watchlist_auto.removeRow(i)
                 if code in self.auto_stock_hits: del self.auto_stock_hits[code]
                 removed_count += 1
@@ -2425,9 +2799,51 @@ class MainWindow(QMainWindow):
                 if self.auto_stock_hits[code] >= 3:
                     self.log(f"🧹 [자동청소] 도태된 종목 제거: {code}")
                     self.strategy.remove_stock(code)
+                    if code in self.strategy.auto_universe: del self.strategy.auto_universe[code]
                     self.table_watchlist_auto.removeRow(i)
                     if code in self.auto_stock_hits: del self.auto_stock_hits[code]
                     removed_count += 1
         
         if removed_count > 0:
+            self.strategy.save_config()
             self.log(f"🤖 총 {removed_count}개의 유효하지 않은 자동 발굴 종목을 정리했습니다.")
+
+    def handle_trade_event(self):
+        """매매 이벤트 발생 시 처리 (잔고 갱신 등)"""
+        # 즉시 잔고 갱신 요청
+        QTimer.singleShot(500, self.refresh_holdings)
+        QTimer.singleShot(1000, self.refresh_asset_status)
+        
+    @pyqtSlot(str, str)
+    def update_status_slot(self, code, status):
+        """TradingManager로부터 상태 업데이트 요청 수신"""
+        # 수동 목록 검색
+        for r in range(self.table_watchlist_manual.rowCount()):
+            if self.table_watchlist_manual.item(r, 0).text() == code:
+                self.table_watchlist_manual.setItem(r, 7, QTableWidgetItem(status))
+                return
+        
+        # 자동 목록 검색
+        for r in range(self.table_watchlist_auto.rowCount()):
+            if self.table_watchlist_auto.item(r, 0).text() == code:
+                self.table_watchlist_auto.setItem(r, 7, QTableWidgetItem(status))
+                return
+    
+    def closeEvent(self, event):
+        """프로그램 종료 시 처리"""
+        self.log("❌ 프로그램 종료 중...")
+        
+        # 타이머 정지 (필수)
+        if hasattr(self, 'verify_timer') and self.verify_timer.isActive(): self.verify_timer.stop()
+        if hasattr(self, 'cleanup_timer') and self.cleanup_timer.isActive(): self.cleanup_timer.stop()
+        if hasattr(self, 'scan_timer') and self.scan_timer.isActive(): self.scan_timer.stop()
+        if hasattr(self, 'trading_timer') and self.trading_timer.isActive(): self.trading_timer.stop()
+        if hasattr(self, 'holdings_timer') and self.holdings_timer.isActive(): self.holdings_timer.stop()
+        
+        # 데이터베이스 연결 종료
+        if hasattr(self, 'db'):
+            try: self.db.close()
+            except: pass
+            
+        # 이벤트 수락
+        event.accept()
